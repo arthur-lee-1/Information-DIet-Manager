@@ -804,12 +804,18 @@ class SentimentAnalyzer:
         提示:
             使用 jieba.analyse.extract_tags(text, topK=top_k, withWeight=True)
         """
-        # TODO: 检查文本是否为空
-        
-        # TODO: 使用 jieba 提取关键词
-        
-        # TODO: 返回关键词列表
-        pass
+        if text is None or pd.isna(text) or str(text).strip() == '':
+            logger.error("文本为空，无法提取关键词")
+            return []
+
+        try:
+            import jieba.analyse
+            keywords = jieba.analyse.extract_tags(text, topK=top_k, withWeight=True)
+            logger.debug(f"成功提取 {len(keywords)} 个关键词")
+            return keywords
+        except Exception as e:
+            logger.error(f"提取关键词失败: {e}")
+            return []
     
     def calculate_semantic_similarity(self, text1: str, text2: str) -> float:
         """
