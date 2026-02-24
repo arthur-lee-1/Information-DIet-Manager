@@ -623,7 +623,7 @@ class SentimentAnalyzer:
     def predict(self, text: str, 
                include_emotions: bool = True,
                include_words: bool = True,
-               use_custom_model: bool = False) -> Dict[str, Any]:
+               use_custom_model: bool = False) -> Dict[str, Any] | None:
         """
         综合预测情感（主入口方法）
 
@@ -644,29 +644,54 @@ class SentimentAnalyzer:
                 'neg_words': 消极词列表 (可选),
                 'emotions': 情绪分析结果 (可选)
             }
-            
-        提示:
-            1. 调用 predict_by_cntext() 获取基础结果
-            2. 计算置信度（基于情感词数量占比）
-            3. 如果启用自定义模型，调用 predict_by_model() 并综合判断
-            4. 根据参数决定是否包含词语列表和情绪分析
         """
-        # TODO: 检查文本是否为空
-        
-        # TODO: 使用 cntext 进行基础情感分析
-        
-        # TODO: 提取情感、极性、词数等信息
-        
-        # TODO: 计算置信度
-        
-        # TODO: 如果启用自定义模型，进行综合判断
-        
-        # TODO: 构建结果字典
-        
-        # TODO: 根据参数添加可选信息（词语列表、情绪）
-        
-        # TODO: 返回完整结果
-        pass
+        if text is None or pd.isna(text) or str(text).strip() == '':
+            logger.error("传入文本为空，无法进行预测")
+            return None
+
+        result = self.predict_by_cntext(text)
+
+        sentiment = result['sentiment']
+        polarity = result['polarity']
+        pos_count = result['sentiment_scores']['pos']
+        neg_count = result['sentiment_scores']['neg']
+
+        words = self._segment_text(text)
+        total_words = len(words)
+        sentiment_words = pos_count + neg_count
+
+        if total_words > 0:
+            confidence = min(sentiment_words / total_words, 1.0)
+        else:
+            confidence = 0.0
+
+        final_result = {
+            'sentiment': sentiment,
+            'polarity': polarity,
+            'pos_count': pos_count,
+            'neg_count': neg_count,
+            'confidence': confidence
+        }
+
+        if use_custom_model and self.model is not None:
+            model_sentiment = self.predict_by_model(text)
+            if model_sentiment:
+                if model_sentiment != sentiment:
+                    logger.info(f"模型预测 ({model_sentiment}) 与词典预测 ({sentiment}) 不一致")
+                    final_result['confidence'] *= 0.7
+                    final_result['model_sentiment'] = model_sentiment
+                else:
+                    final_result['confidence'] = min(confidence * 1.2, 1.0)
+
+        if include_words:
+            final_result['pos_words'] = result.get('pos_words', [])
+            final_result['neg_words'] = result.get('neg_words', [])
+
+        if include_emotions and 'emotions' in result:
+            final_result['emotions'] = result['emotions']
+
+        logger.info(f"预测完成: {sentiment} (置信度: {confidence:.3f})")
+        return final_result
     
     def batch_predict(self, df: pd.DataFrame,
                      text_column: str = 'title',
