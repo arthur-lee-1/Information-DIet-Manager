@@ -55,6 +55,18 @@ except ImportError:
     CNTEXT_AVAILABLE = False
     logger.warning('cntext 未安装，请运行: pip install cntext')
 
+# BERT 相关导入
+try:
+    import torch
+    from transformers import BertTokenizer, BertForSequenceClassification
+    from transformers import AdamW, get_linear_schedule_with_warmup
+    from torch.utils.data import Dataset, DataLoader
+    BERT_AVAILABLE = True
+    logger.info('PyTorch 和 Transformers 可用')
+except ImportError:
+    BERT_AVAILABLE = False
+    logger.warning('BERT 功能不可用，请安装: pip install torch transformers')
+
 class SentimentAnalyzer:
     """
     情感分析器（基于 cntext）
@@ -601,24 +613,33 @@ class SentimentAnalyzer:
 
         返回:
             str: 情感类别
-            
-        提示:
-            - 检查模型和向量化器是否已加载
-            - 使用 self.vectorizer.transform() 向量化文本
-            - 使用 self.model.predict() 预测
         """
-        # TODO: 检查模型是否已加载
         if self.model is None:
-            logger.error("模型未加载成功")
+            logger.error("模型未加载")
             return None
-        # TODO: 检查文本是否为空
+
+        if self.vectorizer is None:
+            logger.error("向量化器未加载")
+            return None
+
+        if text is None or pd.isna(text) or str(text).strip() == "":
+            logger.warning("文本为空")
+            return None
         
-        # TODO: 文本向量化
-        
-        # TODO: 模型预测
-        
-        # TODO: 返回预测结果
-        pass
+        try:
+            words = self._segment_text(text)
+            text_processed = ' '.join(words)
+
+            X = self.vectorizer.transform([text_processed])
+
+            prediction = self.model.predict(X)[0]
+
+            logger.debug(f"模型预测结果: {prediction}")
+            return str(prediction)
+
+        except Exception as e:
+            logger.exception(f"模型预测失败: {e}")
+            return None
     
     def predict(self, text: str, 
                include_emotions: bool = True,
