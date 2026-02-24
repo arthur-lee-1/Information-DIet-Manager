@@ -902,15 +902,53 @@ class SentimentAnalyzer:
             - 使用 pickle 保存模型和向量化器
             - 同时保存词典名称
         """
-        # TODO: 检查模型是否存在
-        
-        # TODO: 创建保存目录
-        
-        # TODO: 使用 pickle 保存模型、向量化器和词典名称
-        
-        # TODO: 记录保存日志
-        pass
-    
+        save_path = Path(path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.use_bert and self.bert_model is not None:
+            # 保存 BERT 模型
+            logger.info("保存 BERT 模型...")
+
+            # 创建模型目录
+            model_dir = save_path.parent / f"{save_path.stem}_bert"
+            model_dir.mkdir(exist_ok=True)
+
+            # 保存模型和 tokenizer
+            self.bert_model.save_pretrained(model_dir)
+            self.bert_tokenizer.save_pretrained(model_dir)
+
+            # 保存标签编码器和其他元数据
+            metadata = {
+                'model_type': 'BERT',
+                'label_encoder': self.label_encoder,
+                'bert_model_name': self.bert_model_name,
+                'diction': self.diction
+            }
+
+            with open(model_dir / 'metadata.pkl', 'wb') as f:
+                pickle.dump(metadata, f)
+
+            logger.info(f"BERT 模型已保存到: {model_dir}")
+
+        elif self.model is not None:
+            # 保存朴素贝叶斯模型
+            logger.info("保存朴素贝叶斯模型...")
+
+            model_data = {
+                'model_type': 'Naive Bayes',
+                'model': self.model,
+                'vectorizer': self.vectorizer,
+                'diction': self.diction
+            }
+
+            with open(path, 'wb') as f:
+                pickle.dump(model_data, f)
+
+            logger.info(f"朴素贝叶斯模型已保存到: {path}")
+        else:
+            logger.error("没有可保存的模型")
+            raise ValueError("No model to save")
+
     def load_model(self, path: str) -> bool:
         """
         加载自定义模型
