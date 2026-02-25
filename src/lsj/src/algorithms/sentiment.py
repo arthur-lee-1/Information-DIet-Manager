@@ -413,7 +413,9 @@ class SentimentAnalyzer:
                 # 尝试使用默认词典
                 logger.warning("未加载词典，尝试使用 cntext 默认行为")
                 try:
-                    raw = ct.sentiment(str(text), diction=ct.read_yaml_dict('zh_common_DUTIR.yaml'))
+                    default_yaml = ct.read_yaml_dict('zh_common_DUTIR.yaml')
+                    default_dict = default_yaml.get('Dictionary', default_yaml)
+                    raw = ct.sentiment(str(text), diction=default_dict)
                 except Exception as e:
                     logger.error(f"使用默认词典失败: {e}")
                     return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
