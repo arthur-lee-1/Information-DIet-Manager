@@ -92,13 +92,16 @@ class EvaluationMetrics:
 @dataclass
 class RiskAlert:
     """风险警报数据类"""
-    # TODO: 定义风险警报结构
     # - 风险类型 (risk_type)
+    risk_type : int
     # - 严重程度 (severity: 1-5)
+    severity : int
     # - 描述信息 (description)
+    description : Optional[str]
     # - 相关数据 (evidence)
+    evidence : Optional[str]
     # - 建议措施 (suggestions)
-    pass
+    suggestions : Optional[str]
 
 
 @dataclass
