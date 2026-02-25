@@ -752,8 +752,8 @@ class SentimentAnalyzer:
 
         pos_count = sentiment_score['pos']
         neg_count = sentiment_score['neg']
-        pos_words = sentiment_score.get('pos_words', sentiment_score.get('pos_word', []))
-        neg_words = sentiment_score.get('neg_words', sentiment_score.get('neg_word', []))
+        pos_words = sentiment_score.get('pos_word', [])
+        neg_words = sentiment_score.get('neg_word', [])
 
         polarity = self.calculate_polarity(pos_count=pos_count, neg_count=neg_count)
 
