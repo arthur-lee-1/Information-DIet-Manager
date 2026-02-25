@@ -1,13 +1,13 @@
+# -*- coding: utf-8 -*-  # 声明文件编码，避免中文乱码
+from __future__ import annotations  # 让 Python 3.8/3.9 支持 | 类型注解
 """
 情感分析模块
-
 功能概述：
     使用 cntext 库对浏览记录进行多维度情感和心理分析
     - 情感分析：积极、消极、中性情感倾向
     - 情绪分析：喜悦、愤怒、悲伤、恐惧等具体情绪
     - 心理特征：态度、认知、价值观等抽象构念
     - 语义分析：主题、关键词、语义相似度
-
 依赖库：
     - cntext: 中文文本分析工具包（核心）
     - jieba: 中文分词
@@ -19,187 +19,140 @@
 参考文档：
     - cntext GitHub: https://github.com/hidadeng/cntext
 """
-import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
-import logging
-import pickle
-from typing import List, Dict, Optional, Tuple, Any
-
-import jieba
-import pandas as pd
-import yaml
-import csv
-
-# ========= 标准化 logger 初始化 =========
-import logging
-from pathlib import Path
-
+# ======== 环境变量设置（必须在 transformers 之前设置） ========
+import os  # 导入系统环境变量模块
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'  # 设置 HuggingFace 国内镜像
+# ======== 标准库导入 ========
+import logging  # 日志模块
+import pickle  # 模型持久化
+from pathlib import Path  # 跨平台路径处理
+from typing import List, Dict, Optional, Tuple, Any  # 类型标注
+import csv  # CSV 文件格式识别
+# ======== 第三方库导入 ========
+import jieba  # 中文分词
+import pandas as pd  # 数据处理
+import yaml  # YAML 读取
+# ==================== Logger 标准化 ====================
 def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging.Logger:
-    """
-    创建标准化 logger（避免重复 handler）
-
-    参数:
-        name: logger 名称
-        log_file: 日志文件路径
-        level: 日志级别
-    """
-    logger_obj = logging.getLogger(name)
-    logger_obj.setLevel(level)
-
+    """创建标准化 logger，避免重复 handler"""
+    logger_obj = logging.getLogger(name)  # 获取 logger
+    logger_obj.setLevel(level)  # 设置日志级别
+    # 如果 handler 已存在，直接返回避免重复
     if logger_obj.handlers:
         return logger_obj
-
-    log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
+    # 创建日志文件夹（如不存在）
+    log_path = Path(log_file)  # 转成 Path 对象
+    log_path.parent.mkdir(parents=True, exist_ok=True)  # 创建目录
+    # 日志格式
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-
+    # 文件输出
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(formatter)
-
+    # 控制台输出
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-
+    # 添加 handler
     logger_obj.addHandler(file_handler)
     logger_obj.addHandler(console_handler)
-
+    # 防止日志重复传播
     logger_obj.propagate = False
     return logger_obj
-
+# 初始化 logger
 logger = setup_logger(__name__, "../../logs/sentiment.log")
-
-import importlib.util
+# ==================== 判断依赖是否存在 ====================
+import importlib.util  # 动态检查模块是否安装
 def _pkg_exists(name: str) -> bool:
-    """判断某个包在当前解释器环境里是否可被找到。"""
-    return importlib.util.find_spec(name) is not None
-# cntext 相关导入
-ct = None  # 先给默认值，避免后面 NameError
-CNTEXT_AVAILABLE = False
-if not _pkg_exists("cntext"):
+    """判断某个包是否可被导入"""
+    return importlib.util.find_spec(name) is not None  # 返回 True/False
+# ==================== cntext 导入 ====================
+ct = None  # 默认值，避免 NameError
+CNTEXT_AVAILABLE = False  # 标记 cntext 是否可用
+if not _pkg_exists("cntext"):  # 如果未安装 cntext
     logger.warning("cntext 未安装（find_spec 找不到），请运行: python -m pip install cntext")
 else:
     try:
-        import cntext as ct
-        CNTEXT_AVAILABLE = True
+        import cntext as ct  # 尝试导入
+        CNTEXT_AVAILABLE = True  # 标记可用
         logger.info("cntext 加载成功: %s, version=%s", ct.__file__, getattr(ct, "__version__", "未知"))
     except Exception as e:
-        CNTEXT_AVAILABLE = False
-        ct = None
-        logger.exception("cntext 已安装但导入失败（不是未安装）。真实异常如下：%r", e)
-# BERT 相关导入
-torch = None
-Dataset = object
-DataLoader = None
-BERT_AVAILABLE = False
+        CNTEXT_AVAILABLE = False  # 导入失败
+        ct = None  # 清空引用
+        logger.exception("cntext 已安装但导入失败。异常: %r", e)
+# ==================== BERT 相关导入 ====================
+torch = None  # 默认 torch
+Dataset = object  # 默认 Dataset
+DataLoader = None  # 默认 DataLoader
+BERT_AVAILABLE = False  # 标记 BERT 是否可用
 try:
-    import torch
-    from torch.utils.data import Dataset, DataLoader
-    from transformers import BertTokenizer, BertForSequenceClassification
-    from torch.optim import AdamW
+    import torch  # PyTorch
+    from torch.utils.data import Dataset, DataLoader  # 数据集与加载器
+    from transformers import BertTokenizer, BertForSequenceClassification  # BERT 模型
+    from torch.optim import AdamW  # 优化器
     try:
-        from transformers import get_linear_schedule_with_warmup  # 有的版本在顶层
+        from transformers import get_linear_schedule_with_warmup  # 新版位置
     except Exception:
-        from transformers.optimization import get_linear_schedule_with_warmup  # 有的版本在 optimization
-    BERT_AVAILABLE = True
+        from transformers.optimization import get_linear_schedule_with_warmup  # 旧版位置
+    BERT_AVAILABLE = True  # 标记可用
     logger.info("BERT 相关依赖加载成功：torch=%s, transformers 已可用", torch.__version__)
 except Exception as e:
-    BERT_AVAILABLE = False
-    logger.exception("BERT 相关依赖导入失败（不一定是未安装）。真实异常如下：%r", e)
-
+    BERT_AVAILABLE = False  # 标记不可用
+    logger.exception("BERT 相关依赖导入失败。异常: %r", e)
+# ==================== 只有 BERT 可用时才定义 Dataset ====================
 if BERT_AVAILABLE:
     class SentimentDataset(Dataset):
-        """
-        BERT 情感分析数据集
-
-        用于将文本数据转换为 BERT 模型可接受的格式
-        """
-
+        """BERT 情感分析数据集"""
         def __init__(self, texts: List[str], labels: List[int],
                      tokenizer, max_length: int = 128):
-            """
-            初始化数据集
-
-            参数:
-                texts: 文本列表
-                labels: 标签列表（整数编码）
-                tokenizer: BERT tokenizer
-                max_length: 最大序列长度
-            """
-            self.texts = texts
-            self.labels = labels
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-
+            self.texts = texts  # 保存文本
+            self.labels = labels  # 保存标签
+            self.tokenizer = tokenizer  # 保存 tokenizer
+            self.max_length = max_length  # 最大长度
         def __len__(self):
-            return len(self.texts)
-
+            return len(self.texts)  # 返回样本数量
         def __getitem__(self, idx):
-            text = str(self.texts[idx])
-            label = self.labels[idx]
-
-            # 使用 tokenizer 编码文本
+            text = str(self.texts[idx])  # 取出文本
+            label = self.labels[idx]  # 取出标签
+            # 编码文本
             encoding = self.tokenizer(
-                text,  # 需要编码的文本
-                add_special_tokens=True,  # 自动加 [CLS] [SEP]
-                max_length=self.max_length,  # 最大长度，超过就截断
-                padding="max_length",  # 不够就补到 max_length
-                truncation=True,  # 允许截断
-                return_attention_mask=True,  # 返回 attention_mask（告诉模型哪些是 padding）
-                return_tensors="pt",  # 直接返回 PyTorch 张量（torch.Tensor）
+                text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors="pt",
             )
             return {
-                # encoding['input_ids'] shape 通常是 [1, max_length]，所以 squeeze(0) 去掉 batch 维度
                 "input_ids": encoding["input_ids"].squeeze(0),
-                # 同理 squeeze(0)
                 "attention_mask": encoding["attention_mask"].squeeze(0),
-                # label 转成 torch tensor，供 loss 计算使用
                 "label": torch.tensor(label, dtype=torch.long),
             }
-
 else:
     class SentimentDataset:
+        """BERT 不可用时的占位类"""
         def __init__(self, *args, **kwargs):
             raise ImportError("BERT 不可用，无法使用 SentimentDataset")
-
-
+# ==================== SentimentAnalyzer 主类 ====================
 class SentimentAnalyzer:
     """
     情感分析器（基于 cntext）
-    
-    设计思路：
-        采用 cntext 多维度分析策略：
-        1. 基础情感分析：使用 cntext 内置词典（大连理工、知网等）
-        2. 情绪维度分析：识别具体情绪类型（喜怒哀惧等）
-        3. 心理特征分析：测量态度、认知、价值观等抽象构念
-        4. 语义分析：主题提取、关键词、语义相似度
-        5. 可选的自定义模型：支持用户训练的机器学习模型
     """
-    
-    # ==================== 类常量 ====================
-    # 基础情感类别
+    # ==== 类常量 ====
     SENTIMENT_POSITIVE = "Positive"
     SENTIMENT_NEGATIVE = "Negative"
     SENTIMENT_NEUTRAL = "Neutral"
-    
-    # 具体情绪类别（基于大连理工情感词典）
-    EMOTION_JOY = "Joy"              # 喜悦 (乐)
-    EMOTION_ANGER = "Anger"          # 愤怒 (怒)
-    EMOTION_SADNESS = "Sadness"      # 悲伤 (哀)
-    EMOTION_FEAR = "Fear"            # 恐惧 (惧)
-    EMOTION_DISGUST = "Disgust"      # 厌恶 (恶)
-    EMOTION_SURPRISE = "Surprise"    # 惊讶 (惊)
-    EMOTION_GOOD = "Good"            # 好评
-    
-    # 心理维度
+    EMOTION_JOY = "Joy"
+    EMOTION_ANGER = "Anger"
+    EMOTION_SADNESS = "Sadness"
+    EMOTION_FEAR = "Fear"
+    EMOTION_DISGUST = "Disgust"
+    EMOTION_SURPRISE = "Surprise"
+    EMOTION_GOOD = "Good"
     PSYCH_ATTITUDE = "Attitude"
     PSYCH_COGNITION = "Cognition"
     PSYCH_EMOTION = "Emotion"
-    
-    # ==================== 初始化方法 ====================
-    
     def __init__(self,
                  diction: str = 'zh_common_DUTIR.yaml',
                  custom_dict_path: Optional[str] = None,
@@ -207,136 +160,74 @@ class SentimentAnalyzer:
                  stopwords_path: Optional[str] = './rules/hit_stopwords.txt',
                  bert_model_name: str = 'bert-base-chinese',
                  use_bert: bool = False):
-        """
-        初始化情感分析器
-
-        参数:
-            diction: 使用的词典
-
-                因此本参数推荐直接传入 cntext 的内置 yaml 文件名，例如：
-                - 'zh_common_DUTIR.yaml'
-                - 'zh_common_HowNet.yaml'
-                - 'zh_common_NTUSD.yaml'
-                - 'zh_common_FinanceSenti.yaml'
-
-                也支持你直接传入一个 Python dict（格式参考 cntext 文档中的 diction 示例）。
-
-            custom_dict_path: 自定义词典文件路径（可选）
-            model_path: 已训练模型的路径（可选）
-            stopwords_path: 停用词文件路径（可选）
-            bert_model_name: BERT 模型名称（默认使用中文 BERT）
-            use_bert: 是否使用 BERT 模型（默认 False）
-        """
         if not CNTEXT_AVAILABLE:
-            logger.error("没有安装 cntext 库，建议使用指令 pip install cntext 安装。否则"
-                        "将有很多功能无法使用")
-            raise ImportError("cntext is required but not installed. Run: pip install cntext")
-
-        self.diction = diction
-        self._cntext_dict_cache: Optional[Dict[str, Any]] = None
-        self.stopwords_path = stopwords_path
-
+            logger.error("没有安装 cntext 库，建议 pip install cntext")
+            raise ImportError("cntext is required but not installed")
+        self.diction = diction  # 保存词典名
+        self._cntext_dict_cache: Optional[Dict[str, Any]] = None  # 缓存词典
+        self.stopwords_path = stopwords_path  # 停用词路径
+        # ===== 加载词典 =====
         if isinstance(self.diction, dict):
             loaded = self.diction
         elif isinstance(self.diction, str):
             try:
                 if self.diction.lower().endswith((".yaml", ".yml")):
-                    if ct is None:
-                        raise ImportError("cntext is not available")
                     loaded = ct.read_yaml_dict(self.diction)
                 else:
-                    logger.warning(
-                        "diction 建议使用内置词典的 yaml 文件名（例如 zh_common_DUTIR.yaml）。"
-                        f"当前收到: {self.diction!r}"
-                    )
+                    logger.warning("diction 建议使用内置 yaml 名")
                     loaded = None
             except Exception as e:
-                logger.exception(f"读取 YAML 词典失败: {self.diction}, error={e}")
+                logger.exception(f"读取 YAML 词典失败: {e}")
                 loaded = None
         else:
             loaded = None
-
         if isinstance(loaded, dict):
-            # 优先使用 Dictionary 字段，如果没有则使用整个字典
-            if 'Dictionary' in loaded:
-                self._cntext_dict_cache = loaded['Dictionary']
-            else:
-                self._cntext_dict_cache = loaded
-
-            # 调试：打印词典结构
+            self._cntext_dict_cache = loaded.get('Dictionary', loaded)
             if self._cntext_dict_cache:
-                logger.info(f"词典加载成功，包含的键: {list(self._cntext_dict_cache.keys())[:10]}")
+                logger.info(f"词典加载成功，包含键: {list(self._cntext_dict_cache.keys())[:10]}")
         else:
+            logger.warning("词典加载失败")
             self._cntext_dict_cache = None
-            logger.warning("词典加载失败，_cntext_dict_cache 为 None")
-
+        # ===== 加载自定义词典 =====
         if custom_dict_path is not None:
             try:
                 self.custom_dict = self._load_custom_dict(custom_dict_path)
-
                 if isinstance(self.custom_dict, dict) and 'Dictionary' in self.custom_dict:
                     self.custom_dict = self.custom_dict.get('Dictionary')
-
-            except OSError as e:
-                logger.error(f"自定义词典不存在，请检查路径: {e}")
-                self.custom_dict = None
-            except UnicodeError as e:
-                logger.error(f"自定义词典内容编码损坏: {e}")
-                self.custom_dict = None
             except Exception as e:
-                logger.exception(f"加载自定义词典时发生异常: {e}")
+                logger.exception(f"加载自定义词典失败: {e}")
                 self.custom_dict = None
         else:
             self.custom_dict = None
-
+        # ===== 加载模型 =====
         if model_path is not None:
             try:
                 with open(model_path, 'rb') as f:
                     data = pickle.load(f)
-
                 if isinstance(data, dict):
                     self.model = data.get('model')
                     self.vectorizer = data.get('vectorizer')
                 else:
                     self.model = data
                     self.vectorizer = None
-                    logger.warning("模型文件中没有 vectorizer，predict_by_model() 将无法使用")
-
-            except OSError as e:
-                logger.error(f"模型不存在，请检查路径: {e}")
-                self.model = None
-                self.vectorizer = None
-            except UnicodeError as e:
-                logger.error(f"模型内容编码损坏: {e}")
-                self.model = None
-                self.vectorizer = None
+                    logger.warning("模型文件中没有 vectorizer")
             except Exception as e:
-                logger.exception(f"加载模型时发生异常: {e}")
+                logger.exception(f"加载模型失败: {e}")
                 self.model = None
                 self.vectorizer = None
         else:
             self.model = None
             self.vectorizer = None
-
-        # 添加 BERT 相关属性
+        # ===== BERT 设置 =====
         self.use_bert = use_bert and BERT_AVAILABLE
         self.bert_model_name = bert_model_name
         self.bert_model = None
         self.bert_tokenizer = None
-        self.label_encoder = None  # 用于标签编码
+        self.label_encoder = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if BERT_AVAILABLE else None
-
         if self.use_bert:
-            if not BERT_AVAILABLE:
-                logger.warning("BERT 不可用，将使用词典方法")
-                self.use_bert = False
-            else:
-                logger.info(f"BERT 模式已启用，使用设备: {self.device}")
-
-        model_status = "已加载" if self.model is not None else "未加载"
-        custom_dict_status = "已加载" if self.custom_dict else "未加载"
-        bert_status = "已启用" if self.use_bert else "未启用"
-        logger.info(f"初始化完成 - 词典: {diction}, 自定义词典: {custom_dict_status}, 模型: {model_status}, BERT: {bert_status}")
+            logger.info(f"BERT 模式已启用，设备: {self.device}")
+        logger.info(f"初始化完成 - 词典: {diction}, BERT: {self.use_bert}")
 
     # ==================== 静态方法 ====================
     
