@@ -13,9 +13,10 @@
 
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
@@ -58,63 +59,455 @@ logger = setup_logger(__name__, "../../logs/evaluator.log")
 
 # ========= 枚举类定义 =========
 class HealthLevel(Enum):
-    """信息摄取健康等级"""
-    EXCELLENT = 1 # 优秀
-    GOOD = 2      # 良好
-    COMMON = 3    # 一般
-    WARNING = 4   # 警告
-    DANGEROUS = 5 # 危险
+    """健康等级"""
+    EXCELLENT = "优秀"      # 90-100分
+    GOOD = "良好"           # 75-89分
+    FAIR = "一般"           # 60-74分
+    WARNING = "警告"        # 40-59分
+    CRITICAL = "危险"       # 0-39分
 
 
 class RiskType(Enum):
     """风险类型"""
-    IT_COCOONS = 1
-    IT_DRUGS = 2
-    WASTE_TIME = 3
-    EMO_CONTAMINATION = 4
+    ECHO_CHAMBER = "信息茧房"
+    TOXIC_CONTENT = "信息毒品"
+    TIME_WASTE = "时间浪费"
+    EMOTION_POLLUTION = "情绪污染"
+    CONTENT_MONOTONY = "内容单一"
+    EXCESSIVE_ENTERTAINMENT = "过度娱乐"
 
-# ========= 数据类定义 =========
+
+class Priority(Enum):
+    """优先级"""
+    URGENT = "紧急"
+    IMPORTANT = "重要"
+    NORMAL = "一般"
+
+
+class Difficulty(Enum):
+    """实施难度"""
+    EASY = "容易"
+    MEDIUM = "中等"
+    HARD = "困难"
+
+
+# ==================== 核心指标数据类 ====================
+
+@dataclass
+class DiversityMetrics:
+    """多样性维度指标"""
+    # 类别多样性
+    category_diversity_score: float  # 0-1
+    category_count: int
+    category_entropy: float  # 香农熵
+    dominant_category: str
+    dominant_category_ratio: float
+
+    # 内容多样性
+    content_diversity_score: float  # 0-1
+    avg_similarity: float
+    duplicate_ratio: float
+    cluster_count: int
+
+    # 原始数据（用于详细分析）
+    category_distribution: Dict[str, int] = field(default_factory=dict)
+    similarity_distribution: List[float] = field(default_factory=list)
+
+
+@dataclass
+class SentimentHealthMetrics:
+    """情感健康维度指标"""
+    # 情感健康分数
+    sentiment_health_score: float  # 0-1
+
+    # 情感分布
+    positive_ratio: float
+    negative_ratio: float
+    neutral_ratio: float
+
+    # 情感极性统计
+    polarity_mean: float
+    polarity_std: float
+    extreme_emotion_count: int
+
+    # 情绪分布（如果有）
+    emotion_distribution: Optional[Dict[str, int]] = None
+    emotion_stability: Optional[float] = None
+
+    # 原始数据
+    sentiment_distribution: Dict[str, int] = field(default_factory=dict)
+    polarity_values: List[float] = field(default_factory=list)
+
+
+@dataclass
+class ContentQualityMetrics:
+    """内容质量维度指标"""
+    # 质量分数
+    content_quality_score: float  # 0-1
+    weighted_quality_score: float  # 加权分数
+
+    # 类别占比
+    learning_ratio: float
+    news_ratio: float
+    tools_ratio: float
+    entertainment_ratio: float
+    social_ratio: float
+    shopping_ratio: float
+    other_ratio: float
+
+    # 原始数据
+    category_time_distribution: Dict[str, float] = field(default_factory=dict)
+    category_weights: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class TimeAllocationMetrics:
+    """时间分配维度指标"""
+    # 时间分配合理性
+    time_allocation_score: float  # 0-1
+
+    # 时段利用率
+    peak_hour_efficiency: float
+    off_hour_waste_ratio: float
+
+    # 碎片化程度
+    fragmentation_score: float  # 0-1，越高越碎片化
+    avg_session_duration: float  # 平均会话时长（分钟）
+
+    # 时间浪费
+    low_efficiency_duration: float  # 小时
+    late_night_entertainment_duration: float  # 小时
+
+    # 时间占比
+    category_time_ratios: Dict[str, float] = field(default_factory=dict)
+
+    # 原始数据
+    hourly_distribution: Dict[int, int] = field(default_factory=dict)  # 24小时分布
+    weekday_distribution: Dict[str, int] = field(default_factory=dict)
+
+
 @dataclass
 class EvaluationMetrics:
-    """评估指标数据类"""
-    # - 多样性分数 (diversity_score)
-    diversity_score : int
-    # - 情感健康分数 (sentiment_health_score)
-    sentiment_health_score : int
-    # - 内容质量分数 (content_quality_score)
-    content_quality_score : int
-    # - 时间分配合理性 (time_allocation_score)
-    time_allocation_score : int
-    # - 综合健康分数 (overall_health_score)
-    overall_health_score : int
+    """综合评估指标"""
+    # 各维度指标
+    diversity: DiversityMetrics
+    sentiment_health: SentimentHealthMetrics
+    content_quality: ContentQualityMetrics
+    time_allocation: TimeAllocationMetrics
+
+    # 综合得分
+    overall_score: float  # 0-100
+
+    # 权重配置
+    dimension_weights: Dict[str, float] = field(default_factory=lambda: {
+        'diversity': 0.25,
+        'sentiment_health': 0.25,
+        'content_quality': 0.30,
+        'time_allocation': 0.20
+    })
+
+
+# ==================== 风险警报数据类 ====================
+
+@dataclass
+class Evidence:
+    """证据数据"""
+    key_statistics: Dict[str, Any] = field(default_factory=dict)  # 关键统计数字
+    problem_examples: List[str] = field(default_factory=list)  # 问题内容示例
+    time_distribution: Optional[Dict[str, Any]] = None  # 时间分布
+    benchmark_comparison: Optional[Dict[str, float]] = None  # 与基准对比
 
 
 @dataclass
 class RiskAlert:
-    """风险警报数据类"""
-    # - 风险类型 (risk_type)
-    risk_type : int
-    # - 严重程度 (severity: 1-5)
-    severity : int
-    # - 描述信息 (description)
-    description : Optional[str]
-    # - 相关数据 (evidence)
-    evidence : Optional[str]
-    # - 建议措施 (suggestions)
-    suggestions : Optional[str]
+    """风险警报"""
+    # 基本信息
+    risk_type: RiskType
+    severity: int  # 1-5
+
+    # 描述
+    brief_description: str  # 一句话简述
+    detailed_description: str  # 详细说明
+
+    # 证据
+    evidence: Evidence
+
+    # 影响分析
+    impact_analysis: str
+    potential_consequences: List[str] = field(default_factory=list)
+
+    # 改进建议
+    suggestions: List[str] = field(default_factory=list)
+    priority: Priority = Priority.NORMAL
+
+
+# ==================== 详细分析数据类 ====================
+
+@dataclass
+class CategoryAnalysis:
+    """类别分析"""
+    # 分布统计
+    distribution_table: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 格式: {category: {count: int, ratio: float, duration: float}}
+
+    # 时间序列
+    time_series: Dict[str, List[Tuple[datetime, int]]] = field(default_factory=dict)
+    # 格式: {category: [(timestamp, count), ...]}
+
+    # 转换矩阵
+    transition_matrix: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # 格式: {from_category: {to_category: probability}}
+
+
+@dataclass
+class SentimentAnalysis:
+    """情感分析"""
+    # 分布数据（饼图）
+    sentiment_pie_data: Dict[str, float] = field(default_factory=dict)
+
+    # 时间序列
+    sentiment_time_series: List[Tuple[datetime, str, float]] = field(default_factory=list)
+    # 格式: [(timestamp, sentiment, polarity), ...]
+
+    # 交叉分析
+    sentiment_by_category: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # 格式: {category: {sentiment: ratio}}
+
+    # Top内容
+    top_positive_content: List[Dict[str, Any]] = field(default_factory=list)
+    top_negative_content: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class SimilarityAnalysis:
+    """相似度分析"""
+    # 分布数据（直方图）
+    similarity_histogram: Dict[str, int] = field(default_factory=dict)
+    # 格式: {bin_range: count}
+
+    # 高相似度对
+    high_similarity_pairs: List[Tuple[int, int, float]] = field(default_factory=list)
+    # 格式: [(idx1, idx2, similarity), ...]
+
+    # 聚类结果
+    cluster_labels: List[int] = field(default_factory=list)
+    cluster_centers: Optional[List[str]] = None  # 每个簇的代表性文本
+
+
+@dataclass
+class TimePatternAnalysis:
+    """时间模式分析"""
+    # 24小时热力图
+    hourly_heatmap: Dict[int, Dict[str, int]] = field(default_factory=dict)
+    # 格式: {hour: {category: count}}
+
+    # 工作日vs周末
+    weekday_vs_weekend: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # 高峰时段
+    peak_hours: List[int] = field(default_factory=list)
+    peak_categories: Dict[int, str] = field(default_factory=dict)
+
+    # 浏览时长分布
+    duration_distribution: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class AnomalyDetection:
+    """异常检测"""
+    # 异常行为列表
+    anomalies: List[Dict[str, Any]] = field(default_factory=list)
+    # 格式: [{timestamp, type, description, severity}, ...]
+
+    # 突变点
+    change_points: List[Tuple[datetime, str, float]] = field(default_factory=list)
+    # 格式: [(timestamp, metric_name, change_magnitude), ...]
+
+    # 周期性模式
+    periodic_patterns: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DetailedAnalysis:
+    """详细分析"""
+    category_analysis: CategoryAnalysis
+    sentiment_analysis: SentimentAnalysis
+    similarity_analysis: SimilarityAnalysis
+    time_pattern_analysis: TimePatternAnalysis
+    anomaly_detection: AnomalyDetection
+
+
+# ==================== 改进建议数据类 ====================
+
+@dataclass
+class ActionableRecommendation:
+    """可操作建议"""
+    action: str  # 具体行动
+    reason: str  # 预期效果
+    difficulty: Difficulty
+    expected_improvement: float  # 预期改善幅度（0-1）
+
+
+@dataclass
+class CategoryBalanceRecommendations:
+    """类别平衡建议"""
+    categories_to_increase: List[str] = field(default_factory=list)
+    categories_to_decrease: List[str] = field(default_factory=list)
+    specific_content_suggestions: List[str] = field(default_factory=list)
+    actions: List[ActionableRecommendation] = field(default_factory=list)
+
+
+@dataclass
+class TimeManagementRecommendations:
+    """时间管理建议"""
+    time_slot_adjustments: List[str] = field(default_factory=list)
+    fragmentation_reduction: List[str] = field(default_factory=list)
+    time_limits: Dict[str, float] = field(default_factory=dict)  # {category: hours}
+    actions: List[ActionableRecommendation] = field(default_factory=list)
+
+
+@dataclass
+class EmotionRegulationRecommendations:
+    """情感调节建议"""
+    reduce_negative_content: List[str] = field(default_factory=list)
+    increase_positive_content: List[str] = field(default_factory=list)
+    emotion_buffer_strategies: List[str] = field(default_factory=list)
+    actions: List[ActionableRecommendation] = field(default_factory=list)
+
+
+@dataclass
+class ContentQualityRecommendations:
+    """内容质量提升建议"""
+    increase_learning_content: List[str] = field(default_factory=list)
+    optimize_information_sources: List[str] = field(default_factory=list)
+    deep_reading_suggestions: List[str] = field(default_factory=list)
+    actions: List[ActionableRecommendation] = field(default_factory=list)
+
+
+@dataclass
+class Recommendations:
+    """改进建议"""
+    # 按优先级分组
+    urgent_recommendations: List[ActionableRecommendation] = field(default_factory=list)
+    important_recommendations: List[ActionableRecommendation] = field(default_factory=list)
+    normal_recommendations: List[ActionableRecommendation] = field(default_factory=list)
+
+    # 分类建议
+    category_balance: CategoryBalanceRecommendations = field(default_factory=CategoryBalanceRecommendations)
+    time_management: TimeManagementRecommendations = field(default_factory=TimeManagementRecommendations)
+    emotion_regulation: EmotionRegulationRecommendations = field(default_factory=EmotionRegulationRecommendations)
+    content_quality: ContentQualityRecommendations = field(default_factory=ContentQualityRecommendations)
+
+
+# ==================== 趋势分析数据类 ====================
+
+@dataclass
+class HistoricalComparison:
+    """历史对比"""
+    comparison_period: str  # "上周" / "上月"
+    metric_changes: Dict[str, float] = field(default_factory=dict)  # {metric: change_rate}
+    improvement_trends: List[str] = field(default_factory=list)
+    deterioration_trends: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PredictiveInsights:
+    """预测性提示"""
+    risk_predictions: List[str] = field(default_factory=list)
+    potential_issues: List[str] = field(default_factory=list)
+    preventive_suggestions: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Milestones:
+    """里程碑记录"""
+    best_performance_date: Optional[datetime] = None
+    best_performance_score: Optional[float] = None
+    worst_performance_date: Optional[datetime] = None
+    worst_performance_score: Optional[float] = None
+    turning_points: List[Tuple[datetime, str]] = field(default_factory=list)
+    # 格式: [(timestamp, description), ...]
+
+
+@dataclass
+class TrendAnalysis:
+    """趋势分析"""
+    historical_comparison: HistoricalComparison
+    predictive_insights: PredictiveInsights
+    milestones: Milestones
+
+
+# ==================== 顶层报告结构 ====================
+
+@dataclass
+class ReportMetadata:
+    """报告元信息"""
+    # 时间范围
+    start_date: datetime
+    end_date: datetime
+
+    # 数据统计
+    total_records: int
+    valid_records: int
+    time_span_days: int
+
+    # 生成信息
+    generated_at: datetime
+    evaluator_version: str
+    config_info: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HealthStatus:
+    """健康状态"""
+    level: HealthLevel
+    score: float  # 0-100
+    justification: str  # 判定依据
 
 
 @dataclass
 class EvaluationReport:
     """完整评估报告"""
-    # TODO: 定义报告结构
-    # - 评估时间范围
-    # - 健康等级
-    # - 评估指标
-    # - 风险警报列表
-    # - 详细分析
-    # - 改进建议
-    pass
+    # 元信息
+    metadata: ReportMetadata
+
+    # 健康状态
+    health_status: HealthStatus
+
+    # 核心指标
+    metrics: EvaluationMetrics
+
+    # 风险警报
+    risk_alerts: List[RiskAlert] = field(default_factory=list)
+
+    # 详细分析
+    detailed_analysis: Optional[DetailedAnalysis] = None
+
+    # 改进建议
+    recommendations: Recommendations = field(default_factory=Recommendations)
+
+    # 趋势信息（可选）
+    trend_analysis: Optional[TrendAnalysis] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典（用于JSON序列化）"""
+        # TODO: 实现递归转换
+        pass
+
+    def to_json(self, filepath: str) -> None:
+        """导出为JSON"""
+        # TODO: 实现JSON导出
+        pass
+
+    def to_markdown(self, filepath: str) -> None:
+        """导出为Markdown"""
+        # TODO: 实现Markdown导出
+        pass
+
+    def get_summary(self) -> str:
+        """获取文字摘要"""
+        # TODO: 生成易读摘要
+        pass
 
 
 # ========= 主评估器类 =========
