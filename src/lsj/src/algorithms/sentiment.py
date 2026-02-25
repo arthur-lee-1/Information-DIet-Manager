@@ -23,9 +23,7 @@ import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import logging
-import os
 import pickle
-from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 
 import jieba
@@ -33,21 +31,45 @@ import pandas as pd
 import yaml
 import csv
 
-# logger 基本设置
-logs_folder_path = "../../logs"
-if not os.path.exists(logs_folder_path):
-    os.makedirs(logs_folder_path)
+# ========= 标准化 logger 初始化 =========
+import logging
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('../../logs/sentiment.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging.Logger:
+    """
+    创建标准化 logger（避免重复 handler）
 
-logger = logging.getLogger(__name__)
+    参数:
+        name: logger 名称
+        log_file: 日志文件路径
+        level: 日志级别
+    """
+    logger_obj = logging.getLogger(name)
+    logger_obj.setLevel(level)
+
+    if logger_obj.handlers:
+        return logger_obj
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logger_obj.addHandler(file_handler)
+    logger_obj.addHandler(console_handler)
+
+    logger_obj.propagate = False
+    return logger_obj
+
+logger = setup_logger(__name__, "../../logs/sentiment.log")
 
 import importlib.util
 def _pkg_exists(name: str) -> bool:
@@ -951,11 +973,6 @@ class SentimentAnalyzer:
 
         返回:
             pd.DataFrame: 添加了情感分析列的 DataFrame
-            
-        提示:
-            - 分批处理避免内存溢出
-            - 对每条文本调用 predict()
-            - 将结果添加为新列：sentiment, polarity, pos_count, neg_count, confidence
         """
         if text_column not in df.columns:
             logger.error(f"列 '{text_column}' 不存在于 DataFrame 中")
@@ -1631,17 +1648,22 @@ class SentimentAnalyzer:
 
         返回:
             pd.Series: 各情感类别的数量统计
-            
-        提示:
-            使用 df['sentiment'].value_counts()
         """
-        # TODO: 检查 sentiment 列是否存在
-        
-        # TODO: 统计各情感类别的数量
-        
-        # TODO: 返回统计结果
-        pass
-    
+        if 'sentiment' not in df.columns:
+            logger.error("DataFrame 中不存在 'sentiment' 列")
+            raise ValueError("Column 'sentiment' not found in DataFrame")
+
+        if df.empty:
+            logger.warning("输入 DataFrame 为空")
+            return pd.Series(dtype=int)
+
+        # 统计各情感类别的数量
+        distribution = df['sentiment'].value_counts().sort_index()
+
+        logger.info(f"情感分布统计完成: {dict(distribution)}")
+
+        return distribution
+
     def get_emotion_distribution(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         统计情绪分布
@@ -1651,20 +1673,45 @@ class SentimentAnalyzer:
             
         返回:
             pd.DataFrame: 各情绪类型的统计
-            
-        提示:
-            - 展开 emotions 列中的字典
-            - 统计各情绪的总数
         """
-        # TODO: 检查 emotions 列是否存在
-        
-        # TODO: 展开情绪字典
-        
-        # TODO: 统计各情绪类型的总数
-        
-        # TODO: 返回统计结果
-        pass
-    
+        if 'emotions' not in df.columns:
+            logger.error("DataFrame 中不存在 'emotions' 列")
+            raise ValueError("Column 'emotions' not found in DataFrame")
+
+        if df.empty:
+            logger.warning("输入 DataFrame 为空")
+            return pd.DataFrame()
+
+        emotion_counts = {}
+
+        for emotions_dict in df['emotions']:
+            if not isinstance(emotions_dict, dict):
+                continue
+
+            for emotion, count in emotions_dict.items():
+                if emotion not in emotion_counts:
+                    emotion_counts[emotion] = 0
+                try:
+                    emotion_counts[emotion] += int(count)
+                except (ValueError, TypeError):
+                    logger.warning(f"无效的情绪计数值: {emotion}={count}")
+                    continue
+
+        # 转换为 DataFrame
+        if not emotion_counts:
+            logger.warning("未找到有效的情绪数据")
+            return pd.DataFrame(columns=['emotion', 'count'])
+
+        result_df = pd.DataFrame([
+            {'emotion': emotion, 'count': count}
+            for emotion, count in emotion_counts.items()
+        ]).sort_values('count', ascending=False).reset_index(drop=True)
+
+        logger.info(f"情绪分布统计完成，共 {len(result_df)} 种情绪")
+
+        # 返回统计结果
+        return result_df
+
     def analyze_sentiment_trend(self, df: pd.DataFrame,
                                time_column: str = 'visit_time',
                                freq: str = 'D') -> pd.DataFrame:
@@ -1678,23 +1725,88 @@ class SentimentAnalyzer:
 
         返回:
             pd.DataFrame: 时间序列的情感统计
-            
-        提示:
-            - 使用 pd.Grouper 按时间分组
-            - 计算每个时间段的平均极性、标准差、数量
-            - 可选：计算移动平均
         """
-        # TODO: 检查必要的列是否存在
-        
-        # TODO: 确保时间列是 datetime 类型
-        
-        # TODO: 按时间分组统计
-        
-        # TODO: 计算移动平均（可选）
-        
-        # TODO: 返回趋势数据
-        pass
-    
+        required_columns = [time_column, 'sentiment', 'polarity']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            logger.error(f"DataFrame 缺少必要的列: {missing_columns}")
+            raise ValueError(f"Missing required columns: {missing_columns}")
+
+        if df.empty:
+            logger.warning("输入 DataFrame 为空")
+            return pd.DataFrame()
+
+        # 创建副本避免修改原数据
+        df_copy = df.copy()
+
+        # 确保时间列是 datetime 类型
+        if not pd.api.types.is_datetime64_any_dtype(df_copy[time_column]):
+            try:
+                df_copy[time_column] = pd.to_datetime(df_copy[time_column])
+                logger.info(f"已将 '{time_column}' 列转换为 datetime 类型")
+            except Exception as e:
+                logger.error(f"无法将 '{time_column}' 转换为 datetime: {e}")
+                raise ValueError(f"Cannot convert '{time_column}' to datetime: {e}")
+
+        # 按时间分组统计
+        try:
+            grouped = df_copy.groupby(pd.Grouper(key=time_column, freq=freq))
+
+            trend_data = grouped.agg({
+                'polarity': ['mean', 'std', 'min', 'max'],
+                'sentiment': 'count'
+            }).reset_index()
+
+            # 扁平化列名
+            trend_data.columns = [
+                time_column,
+                'polarity_mean',
+                'polarity_std',
+                'polarity_min',
+                'polarity_max',
+                'count'
+            ]
+
+            # 填充 NaN 值（标准差在只有一个样本时为 NaN）
+            trend_data['polarity_std'] = trend_data['polarity_std'].fillna(0)
+
+            # 计算移动平均（7 期窗口）
+            if len(trend_data) >= 3:
+                window_size = min(7, len(trend_data))
+                trend_data['polarity_ma'] = trend_data['polarity_mean'].rolling(
+                    window=window_size,
+                    min_periods=1
+                ).mean()
+            else:
+                trend_data['polarity_ma'] = trend_data['polarity_mean']
+
+            # 统计各时间段的情感分布
+            sentiment_dist = df_copy.groupby(
+                [pd.Grouper(key=time_column, freq=freq), 'sentiment']
+            ).size().unstack(fill_value=0)
+
+            # 合并情感分布到趋势数据
+            trend_data = trend_data.merge(
+                sentiment_dist,
+                left_on=time_column,
+                right_index=True,
+                how='left'
+            )
+
+            # 填充缺失的情感类别列
+            for sentiment_type in [self.SENTIMENT_POSITIVE, self.SENTIMENT_NEGATIVE, self.SENTIMENT_NEUTRAL]:
+                if sentiment_type not in trend_data.columns:
+                    trend_data[sentiment_type] = 0
+
+            logger.info(f"情感趋势分析完成，共 {len(trend_data)} 个时间段")
+
+            return trend_data
+
+        except Exception as e:
+            logger.exception(f"分析情感趋势时出错: {e}")
+            raise
+
     def generate_sentiment_report(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         生成综合情感分析报告
@@ -1704,24 +1816,97 @@ class SentimentAnalyzer:
             
         返回:
             Dict[str, Any]: 综合报告
-            
-        提示:
-            包含：情感分布、极性统计、情绪分布、置信度统计、总体统计
         """
-        # TODO: 初始化报告字典
-        
-        # TODO: 统计整体情感分布
-        
-        # TODO: 统计情感极性（均值、标准差、最小值、最大值）
-        
-        # TODO: 统计情绪分布（如果有）
-        
-        # TODO: 统计置信度
-        
-        # TODO: 添加总体统计信息
-        
-        # TODO: 返回完整报告
-        pass
+        # 检查必要的列
+        required_columns = ['sentiment', 'polarity', 'confidence']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            logger.error(f"DataFrame 缺少必要的列: {missing_columns}")
+            raise ValueError(f"Missing required columns: {missing_columns}")
+
+        if df.empty:
+            logger.warning("输入 DataFrame 为空")
+            return {'error': 'Empty DataFrame'}
+
+        # 初始化报告字典
+        report = {
+            'total_records': len(df),
+            'analysis_date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        # 统计整体情感分布
+        sentiment_dist = df['sentiment'].value_counts().to_dict()
+        sentiment_pct = (df['sentiment'].value_counts(normalize=True) * 100).round(2).to_dict()
+
+        report['sentiment_distribution'] = {
+            'counts': sentiment_dist,
+            'percentages': sentiment_pct
+        }
+
+        # 统计情感极性
+        polarity_stats = df['polarity'].describe().to_dict()
+        report['polarity_statistics'] = {
+            'mean': round(polarity_stats.get('mean', 0), 4),
+            'std': round(polarity_stats.get('std', 0), 4),
+            'min': round(polarity_stats.get('min', 0), 4),
+            'max': round(polarity_stats.get('max', 0), 4),
+            'median': round(df['polarity'].median(), 4),
+            'q25': round(polarity_stats.get('25%', 0), 4),
+            'q75': round(polarity_stats.get('75%', 0), 4)
+        }
+
+        # 统计情绪分布（如果有）
+        if 'emotions' in df.columns:
+            try:
+                emotion_df = self.get_emotion_distribution(df)
+                if not emotion_df.empty:
+                    report['emotion_distribution'] = emotion_df.to_dict('records')
+                else:
+                    report['emotion_distribution'] = None
+            except Exception as e:
+                logger.warning(f"统计情绪分布时出错: {e}")
+                report['emotion_distribution'] = None
+        else:
+            report['emotion_distribution'] = None
+
+        # 统计置信度
+        confidence_stats = df['confidence'].describe().to_dict()
+        report['confidence_statistics'] = {
+            'mean': round(confidence_stats.get('mean', 0), 4),
+            'std': round(confidence_stats.get('std', 0), 4),
+            'min': round(confidence_stats.get('min', 0), 4),
+            'max': round(confidence_stats.get('max', 0), 4),
+            'median': round(df['confidence'].median(), 4)
+        }
+
+        # 统计积极/消极词数量（如果有）
+        if 'pos_count' in df.columns and 'neg_count' in df.columns:
+            report['word_statistics'] = {
+                'total_positive_words': int(df['pos_count'].sum()),
+                'total_negative_words': int(df['neg_count'].sum()),
+                'avg_positive_words': round(df['pos_count'].mean(), 2),
+                'avg_negative_words': round(df['neg_count'].mean(), 2)
+            }
+
+        # 添加总体统计信息
+        report['overall_summary'] = {
+            'dominant_sentiment': sentiment_dist.get(
+                max(sentiment_dist, key=sentiment_dist.get), 'Unknown'
+            ) if sentiment_dist else 'Unknown',
+            'overall_polarity': 'Positive' if report['polarity_statistics']['mean'] > 0.1
+                               else 'Negative' if report['polarity_statistics']['mean'] < -0.1
+                               else 'Neutral',
+            'avg_confidence': round(report['confidence_statistics']['mean'], 4),
+            'high_confidence_ratio': round(
+                (df['confidence'] >= 0.7).sum() / len(df) * 100, 2
+            )
+        }
+
+        logger.info("情感分析报告生成完成")
+
+        # 返回完整报告
+        return report
 
 if __name__ == "__main__":
     if not CNTEXT_AVAILABLE:

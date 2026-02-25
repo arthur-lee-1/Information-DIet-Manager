@@ -15,21 +15,45 @@ import jieba
 import numpy as np
 import pandas as pd
 
-# logger 基本设置
-logs_folder_path = "../../logs"
-if not os.path.exists(logs_folder_path):
-    os.makedirs(logs_folder_path)
+# ========= 标准化 logger 初始化 =========
+import logging
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('../../logs/classifier.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging.Logger:
+    """
+    创建标准化 logger（避免重复 handler）
 
-logger = logging.getLogger(__name__)
+    参数:
+        name: logger 名称
+        log_file: 日志文件路径
+        level: 日志级别
+    """
+    logger_obj = logging.getLogger(name)
+    logger_obj.setLevel(level)
+
+    if logger_obj.handlers:
+        return logger_obj
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logger_obj.addHandler(file_handler)
+    logger_obj.addHandler(console_handler)
+
+    logger_obj.propagate = False
+    return logger_obj
+
+logger = setup_logger(__name__, "../../logs/classifier.log")
 
 class ContentClassifier:
     """
