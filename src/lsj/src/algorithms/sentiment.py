@@ -1808,3 +1808,24 @@ if __name__ == "__main__":
     else:
         print("警告: BERT 功能不可用")
         print("如需使用 BERT，请安装: pip install torch transformers")
+
+    print("训练并保存模型")
+
+    df = pd.read_csv("../training_data/converted_dataset.csv")
+    df = df.rename(columns={"label": "sentiment"})
+    analyzer = SentimentAnalyzer(use_bert=True)
+    result = analyzer.train_model(
+        train_df=df,
+        text_column="text",
+        label_column="sentiment",
+        use_bert=True
+    )
+    analyzer.save_model("./models/sentiment_model.pkl")
+    logger.info("✅ 模型保存完成")
+    print(result)
+
+    print("验证加载模型")
+    analyzer = SentimentAnalyzer(use_bert=False)
+    success = analyzer.load_model("models/sentiment_model_bert")
+    logger.info("✅ 加载成功" if success else "❌ 加载失败")
+    print(analyzer.predict("今天心情很好！", use_custom_model=True))
