@@ -832,6 +832,9 @@ class SentimentAnalyzer:
             return None
 
         try:
+            if ct is None:
+                logger.error("cntext 未安装，无法分析可读性")
+                return None
             readability_dict = ct.readability(text)
             logger.debug(f"可读性分析完成: {readability_dict}")
             return readability_dict
