@@ -10,10 +10,10 @@
     - 时间趋势分析：追踪用户浏览习惯的变化
     - 个性化建议：基于评估结果提供改进建议
 """
-
+import json
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
 from datetime import datetime
@@ -526,10 +526,14 @@ class EvaluationReport:
 
         return dataclass_to_dict(self)
 
-    def to_json(self, filepath: str) -> None:
+    def to_json(self, filepath: str, indent: int = 2) -> None:
         """导出为JSON"""
-        # TODO: 实现JSON导出
-        pass
+        data = self.to_dict()
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+
+        logger.info(f"报告导出到: {filepath}")
 
     def to_markdown(self, filepath: str) -> None:
         """导出为Markdown"""
