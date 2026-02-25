@@ -19,6 +19,9 @@
 参考文档：
     - cntext GitHub: https://github.com/hidadeng/cntext
 """
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import logging
 import os
 import pickle
