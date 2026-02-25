@@ -491,8 +491,40 @@ class EvaluationReport:
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（用于JSON序列化）"""
-        # TODO: 实现递归转换
-        pass
+        def dataclass_to_dict(obj: Any) -> Any:
+            if obj is None:
+                return None
+
+            if is_dataclass(obj):
+                result = {}
+                for filed in fields(obj):
+                    value = getattr(obj, filed.name)
+                    result[filed.name] = dataclass_to_dict(value)
+                return result
+
+            # 处理枚举
+            if isinstance(obj, Enum):
+                return obj.value
+
+            # 处理 datetime
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+
+            # 处理列表
+            if isinstance(obj, list):
+                return [dataclass_to_dict(item) for item in obj]
+
+            # 处理元组
+            if isinstance(obj, tuple):
+                return tuple(dataclass_to_dict(item) for item in obj)
+
+            # 处理字典
+            if isinstance(obj, dict):
+                return {key: dataclass_to_dict(value) for key, value in obj.items()}
+
+            return obj
+
+        return dataclass_to_dict(self)
 
     def to_json(self, filepath: str) -> None:
         """导出为JSON"""
