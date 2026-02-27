@@ -1077,7 +1077,19 @@ def weighted_average(scores: Dict[str, float], weights: Dict[str, float]) -> flo
     TODO: 验证权重和为 1
     TODO: 计算加权平均值
     """
-    pass
+    if not scores or not weights:
+        return 0.0
+
+    missing_keys = set(scores.keys()) - set(weights.keys())
+    if missing_keys:
+        raise ValueError(f"weights 缺少以下分数键: {sorted(missing_keys)}")
+
+    weight_sum = float(sum(weights[k] for k in scores.keys()))
+    if weight_sum <= 0:
+        raise ValueError("权重总和必须大于 0")
+
+    weighted_sum = sum(float(scores[k]) * float(weights[k]) for k in scores.keys())
+    return float(weighted_sum / weight_sum)
 
 
 # ==================== 测试代码 ====================
