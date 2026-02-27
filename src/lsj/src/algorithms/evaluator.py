@@ -966,7 +966,7 @@ class InformationQualityEvaluator:
         TODO: 提取关键发现
         TODO: 生成易读的摘要文本
         """
-        pass
+        return report.get_summary()
 
     # ==================== 配置管理 ====================
 
