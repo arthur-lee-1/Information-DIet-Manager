@@ -957,7 +957,39 @@ class InformationQualityEvaluator:
         TODO: 支持 JSON/Markdown/HTML 格式
         TODO: 包含图表和数据
         """
-        pass
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        format_lower = format.lower().strip()
+        if format_lower == "json":
+            report.to_json(str(output))
+            return
+
+        if format_lower in {"md", "markdown"}:
+            report.to_markdown(str(output), detailed=True)
+            return
+
+        if format_lower == "html":
+            data = report.to_dict()
+            summary = report.get_summary()
+            html_content = (
+                "<!DOCTYPE html>\n"
+                "<html lang=\"zh-CN\">\n"
+                "<head><meta charset=\"UTF-8\"><title>信息摄取质量评估报告</title></head>\n"
+                "<body>\n"
+                "<h1>信息摄取质量评估报告</h1>\n"
+                "<h2>摘要</h2>\n"
+                f"<pre>{summary}</pre>\n"
+                "<h2>完整数据（JSON）</h2>\n"
+                f"<pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre>\n"
+                "</body>\n"
+                "</html>\n"
+            )
+            output.write_text(html_content, encoding="utf-8")
+            logger.info(f"HTML 报告已保存到: {output}")
+            return
+
+        raise ValueError("不支持的导出格式，请使用 json / markdown / html")
 
     def generate_summary(self, report: EvaluationReport) -> str:
         """
