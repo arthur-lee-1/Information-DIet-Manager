@@ -207,12 +207,7 @@ class EvaluationMetrics:
     overall_score: float  # 0-100
 
     # 权重配置
-    dimension_weights: Dict[str, float] = field(default_factory=lambda: {
-        'diversity': 0.25,
-        'sentiment_health': 0.25,
-        'content_quality': 0.30,
-        'time_allocation': 0.20
-    })
+    dimension_weights: Dict[str, float] = field(default_factory=lambda: DEFAULT_DIMENSION_WEIGHTS.copy())
 
 
 # ==================== 风险警报数据类 ====================
