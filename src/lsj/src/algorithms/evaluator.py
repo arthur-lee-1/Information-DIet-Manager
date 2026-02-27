@@ -540,8 +540,6 @@ class EvaluationReport:
         """导出为Markdown"""
         generator = ReportMarkdownGenerator()
 
-        md_text = generator.generate(self, detailed=True)
-
         generator.save(self, filepath=filepath, detailed=detailed)
 
         logger.info(f"Markdown 报告已保存到: {filepath}")
@@ -597,10 +595,13 @@ class InformationQualityEvaluator:
     """
 
     # ==================== 类常量 ====================
-    # TODO: 定义阈值常量
+    # 定义阈值常量
     # - 信息茧房阈值（相似度、类别集中度）
+    IT_COCOONS_LIMIT = 0.75
     # - 情感健康阈值（负面情绪比例、极性波动）
+    SENTIMENT_LIMIT = 0.75
     # - 时间分配阈值（娱乐/学习比例）
+    TIME_DISTRIBUTION_LIMIT = 0.5
 
     def __init__(
         self,
@@ -618,10 +619,21 @@ class InformationQualityEvaluator:
             similarity_analyzer: 相似度分析器实例
             config: 自定义配置（阈值、权重等）
         """
-        # TODO: 初始化三个分析器（如果未提供则创建默认实例）
-        # TODO: 加载配置（阈值、权重、评分规则）
-        # TODO: 初始化缓存和状态变量
-        pass
+        # 初始化三个分析器
+        self.sentiment = sentiment_analyzer if sentiment_analyzer else SentimentAnalyzer()
+        self.content = content_classifier if content_classifier else ContentClassifier()
+        self.similarity = similarity_analyzer if similarity_analyzer else SimilarityAnalyzer()
+
+        # 加载配置（阈值、权重、评分规则）
+        self.config = self.get_default_config()
+        if config is not None:
+            self.update_config(config)
+
+        # 初始化缓存和状态变量
+        self._cache : Dict[str, Any] = {}
+        self.last_report: Optional[EvaluationReport] = None
+
+        logger.info("InformationQualityEvaluator 初始化完成")
 
     # ==================== 私有方法：数据预处理 ====================
 
