@@ -20,6 +20,7 @@ from datetime import datetime
 
 import pandas as pd
 import numpy as np
+from pandas.conftest import dropna
 
 from lsj.src.algorithms.utils.change_csv import df
 # 导入已完成的模块
@@ -652,25 +653,25 @@ class InformationQualityEvaluator:
         验证输入数据格式
         """
         if isinstance(df, pd.DataFrame):
-            logger.error("传入数据类型错误")
-            raise TypeError("数据类型不为 pd.DataFrame")
+            logger.error("输入数据必须是 pandas.DataFrame")
+            raise TypeError("输入数据必须是 pandas.DataFrame")
 
         if df.empty:
-           logger.error("传入数据为空")
-           raise ValueError("传入数据为空")
+           logger.error("输入 DataFrame 为空，无法评估")
+           raise ValueError("输入 DataFrame 为空，无法评估")
 
-        necessary_col = ['title', 'url', 'category', 'sentiment', 'polarity', 'similarity']
-        missing = len(necessary_col) - len(set(df.columns))
+        required_columns = {"title", "url", "category", "sentiment", "polarity", "similarity"}
+        missing_columns = sorted(required_columns - set(df.columns))
 
-        if missing > 0:
-            logger.error("传入数据有缺失列")
-            raise ValueError("传入数据有缺失列")
+        if missing_columns:
+            logger.error(f"缺少必需列: {missing_columns}")
+            raise ValueError(f"缺少必需列: {missing_columns}")
 
-        min_records = self.config.get('min_records', 5)
+        min_records = int(self.config.get('min_records', 5))
 
         if len(df) < min_records:
-            logger.warning("传入数据低于最小数据量阈值")
-            raise ValueError("数据量不足")
+            logger.warning(f"样本量不足：当前 {len(df)} 条，至少需要 {min_records} 条")
+            raise ValueError(f"样本量不足：当前 {len(df)} 条，至少需要 {min_records} 条")
 
         return True
 
@@ -683,7 +684,19 @@ class InformationQualityEvaluator:
         TODO: 时间列转换和排序
         TODO: 添加辅助列（日期、小时、星期等）
         """
-        pass
+        processed_df = df.copy()
+
+        processed_df['title'] = processed_df['title'].astype(str).str.strip()
+        processed_df['url'] = processed_df['url'].astype(str).str.strip()
+        processed_df['category'] = processed_df['category'].astype(str).str.strip()
+        processed_df['sentiment'] = processed_df['sentiment'].astype(str).str.strip()
+
+        processed_df.dropna(subset=["category", "sentiment", "polarity", "similarity"])
+
+        processed_df['polarity'] = pd.to_numeric(processed_df['polarity'], errors='coerce')
+        processed_df['similarity'] = pd.to_numeric(processed_df['similarity'], errors='coerce')
+
+        processed_df.dropna(subset=["polarity", "similarity"])
 
     # ==================== 私有方法：多样性分析 ====================
 
