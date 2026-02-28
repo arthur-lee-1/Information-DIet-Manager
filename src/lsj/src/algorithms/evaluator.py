@@ -724,12 +724,26 @@ class InformationQualityEvaluator:
     def _calculate_category_diversity(self, df: pd.DataFrame) -> float:
         """
         计算类别多样性（基于分类结果）
-
-        TODO: 使用香农熵或基尼系数计算类别分布均匀度
-        TODO: 考虑类别数量和分布
-        TODO: 返回 0-1 标准化分数
         """
-        pass
+        category_counts = df['category'].value_counts()
+        probs = category_counts / category_counts.sum()
+
+        H = calculate_shannon_entropy(probs.tolist())
+
+        n_categories = len(category_counts)
+        if n_categories <= 1:
+            H_max = 0.0
+        else:
+            H_max = np.log2(n_categories)
+
+        if H_max == 0.0:
+            score = 0.0
+        else:
+            score = H / H_max
+
+        score = float(np.clip(score, 0.0, 1.0))
+
+        return score
 
     def _calculate_content_diversity(self, df: pd.DataFrame) -> float:
         """
@@ -949,9 +963,6 @@ class InformationQualityEvaluator:
     def quick_evaluate(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         快速评估（简化版）
-
-        TODO: 只计算核心指标
-        TODO: 返回简化的评估结果
         """
         self._validate_dataframe(df)
         processed_df = self._preprocess_data(df)
