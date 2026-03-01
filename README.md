@@ -1,4 +1,7 @@
-# Information Diet Manager
+# Information-DIet-Manager
+2Manage the information you take in every day just like you manage your diet.
+
+You can define your own database location by setting the IDM_DB_PATH environment variable, otherwise the database location will be created in this directory.
 
 ## 项目简介
 
@@ -62,7 +65,3 @@ Information-DIet-Manager/
 ## 贡献与开发
 - 欢迎提交 issue 或 pull request。
 - 新增插件或分析模块请遵循模块化设计原则。
-
-## 联系方式
-- 项目主页：https://github.com/lkjing2021345/Information-DIet-Manager
-- 邮箱：
