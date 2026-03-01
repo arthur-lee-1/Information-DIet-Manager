@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Information Diet Manager",
   "version": "0.1.0",
-  "description": "Collect browsing data to analyze your information diet and assess information bubble degree.",
+  "description": "采集浏览数据，分析你的信息饮食结构，评估信息茧房程度。",
   "permissions": [
     "tabs",
     "storage",
@@ -24,6 +24,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Information Diet Manager"
+    "default_title": "信息饮食管理器"
   }
 }

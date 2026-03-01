@@ -1,4 +1,4 @@
-// popup.js — Settings UI for the Information Diet Manager extension
+// popup.js — 信息饮食管理器插件的设置界面
 
 (function () {
   "use strict";
@@ -10,7 +10,7 @@
   const saveBtn = document.getElementById("save");
   const statusEl = document.getElementById("status");
 
-  // Load saved settings
+  // 加载已保存的设置
   chrome.storage.local.get({ apiBase: DEFAULT_API, enabled: true }, (cfg) => {
     apiInput.value = cfg.apiBase;
     enabledBox.checked = cfg.enabled;

@@ -1,5 +1,5 @@
-// content.js — Extracts meta description and truncated body text,
-// then sends to the background service worker.
+// content.js — 提取页面 meta description 和截断后的正文，
+// 然后发送给 background service worker。
 
 (function () {
   "use strict";
@@ -16,15 +16,15 @@
   function getBodyText() {
     const body = document.body;
     if (!body) return "";
-    // Clone to avoid modifying the real DOM
+    // 克隆 DOM 以避免修改真实页面
     const clone = body.cloneNode(true);
-    // Remove script, style, noscript, nav, footer, header elements
+    // 移除 script、style、noscript、nav、footer、header 等元素
     const removeTags = ["script", "style", "noscript", "nav", "footer", "header"];
     removeTags.forEach((tag) => {
       clone.querySelectorAll(tag).forEach((el) => el.remove());
     });
     const raw = clone.innerText || clone.textContent || "";
-    // Collapse whitespace
+    // 合并连续空白字符
     return raw.replace(/\s+/g, " ").trim();
   }
 
@@ -38,6 +38,6 @@
       text: text,
     });
   } catch {
-    // Silently ignore errors in restricted pages
+    // 在受限页面中静默忽略错误
   }
 })();
