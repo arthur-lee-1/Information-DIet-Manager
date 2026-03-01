@@ -767,15 +767,67 @@ class InformationQualityEvaluator:
 
     # ==================== 私有方法：情感健康分析 ====================
 
-    def _calculate_sentiment_health(self, df: pd.DataFrame) -> float:
+    def _calculate_sentiment_health(self,
+                                    df: pd.DataFrame,
+                                    std_scale: float = 1.0,
+                                    alpha: float = 0.7,
+                                    neutral_weight: float = 0.5,
+                                    neutral_eps: float = 0.0,
+                                    empty_score: float = 0.5
+                                    ) -> float:
         """
         计算情感健康分数
-
-        TODO: 分析情感分布（积极/消极/中性比例）
-        TODO: 计算情感极性的稳定性
-        TODO: 检测极端情绪波动
         """
-        pass
+        if isinstance(df, pd.DataFrame):
+            logger.error("输入数据必须是 pandas.DataFrame")
+            raise TypeError("输入数据必须是 pandas.DataFrame")
+
+        if df.empty or df is None:
+            logger.error("输入 DataFrame 为空，无法评估")
+            raise ValueError("输入 DataFrame 为空，无法评估")
+
+        s = df['polarity']
+        s_valid = s.dropna()
+
+        if s_valid.empty:
+            return float(np.clip(empty_score, 0.0, 1.0))
+
+        s_num = pd.to_numeric(s_valid, errors='coerce')
+        if s_num.notna().all():
+            total = len(s_num)
+
+            positive_mask = s_num > neutral_eps
+            negative_mask = s_num < -neutral_eps
+            neutral_mask = ~(positive_mask | negative_mask)
+
+            positive_ratio = float(positive_mask.mean())
+            negative_ratio = float(negative_mask.mean())
+            neutral_ratio = float(neutral_mask.mean())
+
+            polarity_std = float(s_num.std(ddof=1)) if total >= 2 else 0.0
+        else:
+            s_str = s_valid.astype(str).str.lower()
+            total = len(s_str)
+
+            positive_ratio = float((s_str == "positive").mean())
+            negative_ratio = float((s_str == "negative").mean())
+            neutral_ratio = float((s_str == "neutral").mean())
+
+            polarity_std = 0.0
+
+        polarity_std_norm = float(np.clip(polarity_std / std_scale, 0.0, 1.0))
+
+        balance = positive_ratio + neutral_weight * neutral_ratio - negative_ratio
+        balance_norm = float(np.clip((balance + 1.0) / 2.0, 0.0, 1.0))
+
+        stability = 1.0 - polarity_std_norm
+
+        score = alpha * balance_norm + (1.0 - alpha) * stability
+        score = float(np.clip(score, 0.0, 1.0))
+
+        return score
+
+
 
     def _detect_toxic_content(self, df: pd.DataFrame) -> Tuple[bool, float, List[Dict]]:
         """
