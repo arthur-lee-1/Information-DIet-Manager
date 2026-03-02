@@ -1692,17 +1692,41 @@ class InformationQualityEvaluator:
     ) -> None:
         """
         导出评估报告
-        TODO: 包含图表和数据
         """
-        if format == 'json':
-            return report.to_json(output_path)
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
 
-        if format == 'markdown':
-            return report.to_markdown(output_path)
+        fmt = format.strip().lower()
 
-        else:
-            logger.warning("不是支持的输出格式，已默认输出json格式")
-            return report.to_json(output_path)
+        if fmt == "json":
+            report.to_json(str(output))
+            return
+
+        if fmt in {"markdown", "md"}:
+            report.to_markdown(str(output), detailed=True)
+            return
+
+        if fmt == "html":
+            data = report.to_dict()
+            summary = report.get_summary()
+            html_content = (
+                "<!DOCTYPE html>\n"
+                "<html lang='zh-CN'>\n"
+                "<head><meta charset='UTF-8'><title>信息摄取质量评估报告</title></head>\n"
+                "<body>\n"
+                "<h1>信息摄取质量评估报告</h1>\n"
+                "<h2>摘要</h2>\n"
+                f"<pre>{summary}</pre>\n"
+                "<h2>完整数据（JSON）</h2>\n"
+                f"<pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre>\n"
+                "</body>\n"
+                "</html>\n"
+            )
+            output.write_text(html_content, encoding="utf-8")
+            logger.info(f"HTML 报告已保存到: {output}")
+            return
+
+        raise ValueError("不支持的导出格式，请使用 json / markdown(md) / html")
 
     def generate_summary(self, report: EvaluationReport) -> str:
         """
@@ -1715,10 +1739,6 @@ class InformationQualityEvaluator:
     def update_config(self, config: Dict[str, Any]) -> None:
         """
         更新评估配置
-
-        TODO: 更新阈值
-        TODO: 更新权重
-        TODO: 验证配置有效性
         """
         if not isinstance(config, dict):
             raise TypeError("config 必须是 dict")
