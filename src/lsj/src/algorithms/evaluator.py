@@ -1720,7 +1720,71 @@ class InformationQualityEvaluator:
         TODO: 更新权重
         TODO: 验证配置有效性
         """
-        pass
+        if not isinstance(config, dict):
+            raise TypeError("config 必须是 dict")
+
+         # 先以当前配置为基础；若不存在则用默认
+        current = self.config.copy() if isinstance(self.config, dict) else self.get_default_config()
+
+        if "thresholds" not in current or not isinstance(current["thresholds"], dict):
+            current["thresholds"] = self.get_default_config()["thresholds"].copy()
+        if "weights" not in current or not isinstance(current["weights"], dict):
+            current["weights"] = self.get_default_config()["weights"].copy()
+
+        # 1) min_records
+        if "min_records" in config:
+            min_records = config["min_records"]
+            if not isinstance(min_records, int) or min_records <= 0:
+                raise ValueError("min_records 必须是正整数")
+            current["min_records"] = min_records
+
+        # 2) thresholds
+        if "thresholds" in config:
+            thresholds = config["thresholds"]
+            if not isinstance(thresholds, dict):
+                raise TypeError("thresholds 必须是 dict")
+
+            allowed_thresholds = set(self.get_default_config()["thresholds"].keys())
+            unknown_keys = set(thresholds.keys()) - allowed_thresholds
+            if unknown_keys:
+                raise ValueError(f"未知阈值配置项: {sorted(unknown_keys)}")
+
+            for k, v in thresholds.items():
+                if not isinstance(v, (int, float)):
+                    raise TypeError(f"thresholds['{k}'] 必须是数值")
+                v = float(v)
+                if v < 0 or v > 1:
+                    raise ValueError(f"thresholds['{k}'] 必须在 [0,1] 区间")
+                current["thresholds"][k] = v
+
+        # 3) weights
+        if "weights" in config:
+            weights = config["weights"]
+            if not isinstance(weights, dict):
+                raise TypeError("weights 必须是 dict")
+
+            required_keys = set(self.DEFAULT_WEIGHTS.keys())
+            if set(weights.keys()) != required_keys:
+                raise ValueError(f"weights 必须且只能包含: {sorted(required_keys)}")
+
+            cleaned_weights = {}
+            for k, v in weights.items():
+                if not isinstance(v, (int, float)):
+                    raise TypeError(f"weights['{k}'] 必须是数值")
+                v = float(v)
+                if v < 0:
+                    raise ValueError(f"weights['{k}'] 不能为负数")
+                cleaned_weights[k] = v
+
+            total = sum(cleaned_weights.values())
+            if total <= 0:
+                raise ValueError("weights 总和必须大于 0")
+
+            # 自动归一化
+            current["weights"] = {k: v / total for k, v in cleaned_weights.items()}
+
+        self.config = current
+        logger.info(f"评估配置已更新: {self.config}")
 
     def get_default_config(self) -> Dict[str, Any]:
         """
