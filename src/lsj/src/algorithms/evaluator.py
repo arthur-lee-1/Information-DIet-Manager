@@ -20,6 +20,7 @@ from datetime import datetime
 
 import pandas as pd
 import numpy as np
+from pandas import to_numeric
 
 # 导入已完成的模块
 from sentiment import SentimentAnalyzer
@@ -746,12 +747,49 @@ class InformationQualityEvaluator:
     def _calculate_content_diversity(self, df: pd.DataFrame) -> float:
         """
         计算内容多样性（基于相似度）
-
-        TODO: 分析内容重复度
-        TODO: 计算平均相似度
-        TODO: 识别聚类模式
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("输入数据必须是 pandas.DataFrame")
+        if "similarity" not in df.columns:
+            raise ValueError("缺少 similarity 列，无法计算内容多样性")
+
+        sim = pd.to_numeric(df["similarity"], errors="coerce").dropna().clip(0.0, 1.0)
+        if sim.empty:
+            # 无有效相似度时 给中性分 缓存空细节
+            self._cache["content_diversity_details"] = {
+                "avg_similarity": 0.5,
+                "duplicate_ratio": 0.0,
+                "cluster_count": 0,
+                "concentration": 0.0,
+                "similarity_distribution": []
+            }
+            return 0.5
+
+        avg_similarity = float(sim.mean())
+        duplicate_threshold = 0.85
+        duplicate_ratio = float((sim >= duplicate_threshold).mean())
+
+        bins = [0.0, 0.4, 0.7, 1.01]
+        labels = ["low", "mid", "high"]
+        bucket = pd.cut(sim, bins=bins, labels=labels, right=False, include_lowest=True)
+
+        bucket_counts = bucket.value_counts(dropna=True)
+        cluster_count = int((bucket_counts > 0).sum())
+        concentration = float(bucket_counts.max() / len(sim)) if not bucket_counts.empty else 0.0
+
+        score = 1.0 - (0.50 * avg_similarity + 0.35 * duplicate_ratio + 0.15 * concentration)
+        score = float(np.clip(score, 0.0, 1.0))
+
+        self._cache["content_diversity_details"] = {
+            "avg_similarity": avg_similarity,
+            "duplicate_ratio": duplicate_ratio,
+            "cluster_count": cluster_count,
+            "concentration": concentration,
+            "similarity_distribution": sim.tolist(),
+            "bucket_distribution": {str(k): int(v) for k, v in bucket_counts.to_dict().items()}
+        }
+
+        return score
 
     def _detect_echo_chamber(self, df: pd.DataFrame) -> Tuple[bool, float, Dict[str, Any]]:
         """
