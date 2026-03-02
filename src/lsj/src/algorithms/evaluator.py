@@ -942,7 +942,136 @@ class InformationQualityEvaluator:
         TODO: 分析不同时段的浏览模式
         TODO: 识别时间浪费行为（深夜娱乐、工作时间分心）
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("输入数据必须是 pandas.DataFrame")
+        if df.empty:
+            raise ValueError("输入 DataFrame 为空，无法分析时间分配")
+
+        working_df = df.copy()
+
+        time_col = None
+        if "timestamp" in working_df.columns:
+            time_col = "timestamp"
+            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
+        elif "visit_time" in working_df.columns:
+            time_col = "visit_time"
+            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
+        elif "ts" in working_df.columns:
+            time_col = "ts"
+            ts_num = pd.to_numeric(working_df["ts"], errors="coerce")
+
+            inferred_unit = "ms" if float(ts_num.dropna().median()) > 1e11 else "s"
+            working_df[time_col] = pd.to_datetime(ts_num, unit=inferred_unit, errors="coerce")
+
+        if time_col is not None:
+            working_df = working_df.dropna(subset=[time_col]).sort_values(time_col)
+            working_df["hour"] = working_df[time_col].dt.hour
+            working_df["weekday"] = working_df[time_col].dt.day_name()
+        else:
+            working_df["hour"] = np.nan
+            working_df["weekday"] = np.nan
+
+        if working_df.empty:
+            raise ValueError("可用时间数据为空，无法分析时间分配")
+
+        # 计算类别时间占比 在没有真实 duration 时 用记录数占比近似
+        if "category" in working_df.columns:
+            category_series = working_df["category"].astype(str).str.lower().str.strip()
+            category_time_ratios = category_series.value_counts(normalize=True).to_dict()
+        else:
+            category_series = pd.Series(["other"] * len(working_df), index=working_df.index)
+            category_time_ratios = {"other": 1.0}
+
+        # 时段分布
+        hourly_distribution = {}
+        weekday_distribution = {}
+        if working_df["hour"].notna().any():
+            hourly_distribution = (
+                working_df["hour"]
+                .dropna()
+                .astype(int)
+                .value_counts()
+                .sort_index()
+                .to_dict()
+            )
+        if working_df["weekday"].notna().any():
+            weekday_distribution = (
+                working_df["weekday"]
+                .dropna()
+                .astype(str)
+                .value_counts()
+                .to_dict()
+            )
+
+        # 低效时段与深夜娱乐
+        off_hours = {23, 0, 1, 2, 3, 4, 5, 6}
+        off_hour_mask = working_df["hour"].isin(off_hours) if "hour" in working_df.columns else pd.Series(False, index=working_df.index)
+        off_hour_count = int(off_hour_mask.sum())
+        off_hour_waste_ratio = float(off_hour_count / len(working_df))
+
+        entertainment_mask = category_series.eq("entertainment")
+        late_night_entertainment_count = int((off_hour_mask & entertainment_mask).sum())
+
+        # 会话碎片化 通过相邻访问时间差估算
+        avg_session_duration = 5.0  # 默认值（分钟）
+        fragmentation_score = 0.5
+        if time_col is not None and len(working_df) >= 2:
+            deltas = working_df[time_col].diff().dt.total_seconds().div(60).dropna()
+            # 间隔大于 30 分钟视作新会话切分点
+            boundary_points = deltas[deltas > 30].index.tolist()
+
+            session_starts = [working_df.index.min()] + boundary_points
+            session_ends = boundary_points + [working_df.index.max()]
+
+            session_durations = []
+            for s_idx, e_idx in zip(session_starts, session_ends):
+                start_time = working_df.loc[s_idx, time_col]
+                end_time = working_df.loc[e_idx, time_col]
+                duration_min = max((end_time - start_time).total_seconds() / 60.0, 1.0)
+                session_durations.append(duration_min)
+
+            if session_durations:
+                avg_session_duration = float(np.mean(session_durations))
+
+            # 平均会话越短，碎片化越高
+            fragmentation_score = float(np.clip(1.0 - (avg_session_duration / 30.0), 0.0, 1.0))
+
+        # 峰时效率（09:00-18:00 中高价值类别占比）
+        productive_categories = {"learning", "news", "tools"}
+        peak_mask = working_df["hour"].between(9, 18) if "hour" in working_df.columns else pd.Series(False, index=working_df.index)
+        peak_total = int(peak_mask.sum())
+        if peak_total > 0:
+            peak_productive = int((peak_mask & category_series.isin(productive_categories)).sum())
+            peak_hour_efficiency = float(peak_productive / peak_total)
+        else:
+            peak_hour_efficiency = 0.5
+
+        # 时长近似：history_data.csv 无 duration，用“每条记录约 3 分钟”估算
+        minutes_per_record = 3.0
+        low_efficiency_duration = float(off_hour_count * minutes_per_record / 60.0)
+        late_night_entertainment_duration = float(late_night_entertainment_count * minutes_per_record / 60.0)
+
+        # 8) 综合分 惩罚项越高分越低
+        late_night_ratio = float(late_night_entertainment_count / len(working_df))
+        time_allocation_score = 1.0 - (
+            0.45 * off_hour_waste_ratio +
+            0.30 * fragmentation_score +
+            0.25 * late_night_ratio
+        )
+        time_allocation_score = float(np.clip(time_allocation_score, 0.0, 1.0))
+
+        return {
+            "time_allocation_score": time_allocation_score,
+            "peak_hour_efficiency": float(np.clip(peak_hour_efficiency, 0.0, 1.0)),
+            "off_hour_waste_ratio": float(np.clip(off_hour_waste_ratio, 0.0, 1.0)),
+            "fragmentation_score": float(np.clip(fragmentation_score, 0.0, 1.0)),
+            "avg_session_duration": float(avg_session_duration),
+            "low_efficiency_duration": float(max(low_efficiency_duration, 0.0)),
+            "late_night_entertainment_duration": float(max(late_night_entertainment_duration, 0.0)),
+            "category_time_ratios": category_time_ratios,
+            "hourly_distribution": hourly_distribution,
+            "weekday_distribution": weekday_distribution,
+        }
 
     def _detect_time_waste(self, df: pd.DataFrame) -> List[RiskAlert]:
         """
