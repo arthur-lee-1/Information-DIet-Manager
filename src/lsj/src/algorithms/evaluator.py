@@ -20,9 +20,7 @@ from datetime import datetime
 
 import pandas as pd
 import numpy as np
-from pandas.conftest import dropna
 
-from lsj.src.algorithms.utils.change_csv import df
 # 导入已完成的模块
 from sentiment import SentimentAnalyzer
 from classifier import ContentClassifier
@@ -687,12 +685,12 @@ class InformationQualityEvaluator:
         processed_df['category'] = processed_df['category'].astype(str).str.strip()
         processed_df['sentiment'] = processed_df['sentiment'].astype(str).str.strip()
 
-        processed_df.dropna(subset=["category", "sentiment", "polarity", "similarity"])
+        processed_df = processed_df.dropna(subset=["category", "sentiment", "polarity", "similarity"])
 
         processed_df['polarity'] = pd.to_numeric(processed_df['polarity'], errors='coerce')
         processed_df['similarity'] = pd.to_numeric(processed_df['similarity'], errors='coerce')
 
-        processed_df.dropna(subset=["polarity", "similarity"])
+        processed_df = processed_df.dropna(subset=["polarity", "similarity"])
 
         processed_df["polarity"] = processed_df["polarity"].clip(-1.0, 1.0)
         processed_df["similarity"] = processed_df["similarity"].clip(0.0, 1.0)
@@ -702,7 +700,7 @@ class InformationQualityEvaluator:
 
             processed_df = processed_df.dropna(subset=['timestamp'])
 
-            processed_df = processed_df.sort_values(by=['timestamp'], ascending=False)
+            processed_df = processed_df.sort_values(by=['timestamp'], ascending=True)
 
             processed_df["date"] = processed_df["timestamp"].dt.date
             processed_df["hour"] = processed_df["timestamp"].dt.hour
@@ -938,9 +936,7 @@ class InformationQualityEvaluator:
         """
         分析时间分配合理性
 
-        TODO: 统计各类别的时间占比
-        TODO: 分析不同时段的浏览模式
-        TODO: 识别时间浪费行为（深夜娱乐、工作时间分心）
+        兼容时间字段：timestamp / visit_time / ts
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("输入数据必须是 pandas.DataFrame")
@@ -1116,9 +1112,7 @@ class InformationQualityEvaluator:
         """
         综合识别风险
 
-        TODO: 基于各项指标判断风险类型
-        TODO: 评估风险严重程度
-        TODO: 生成风险警报列表
+        依据 metrics 中已计算指标进行判定，避免重复扫描原始数据。
         """
         if not isinstance(metrics, EvaluationMetrics):
             raise TypeError("metrics 必须是 EvaluationMetrics 实例")
