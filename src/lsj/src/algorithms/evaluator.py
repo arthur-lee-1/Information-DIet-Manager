@@ -1120,7 +1120,178 @@ class InformationQualityEvaluator:
         TODO: 评估风险严重程度
         TODO: 生成风险警报列表
         """
-        pass
+        if not isinstance(metrics, EvaluationMetrics):
+            raise TypeError("metrics 必须是 EvaluationMetrics 实例")
+
+        risks: List[RiskAlert] = []
+        thresholds = self.config.get("thresholds", {})
+
+        def build_alert(
+            risk_type: RiskType,
+            severity: int,
+            brief_description: str,
+            detailed_description: str,
+            impact_analysis: str,
+            key_statistics: Dict[str, Any],
+            suggestions: List[str],
+        ) -> RiskAlert:
+            severity = int(np.clip(severity, 1, 5))
+            priority = Priority.URGENT if severity >= 5 else Priority.IMPORTANT if severity >= 4 else Priority.NORMAL
+            return RiskAlert(
+                risk_type=risk_type,
+                severity=severity,
+                brief_description=brief_description,
+                detailed_description=detailed_description,
+                evidence=Evidence(key_statistics=key_statistics),
+                impact_analysis=impact_analysis,
+                potential_consequences=[],
+                suggestions=suggestions,
+                priority=priority,
+            )
+
+        # 信息茧房：类别过于集中 + 内容相似度过高
+        dom_ratio = float(metrics.diversity.dominant_category_ratio)
+        avg_similarity = float(metrics.diversity.avg_similarity)
+        dom_limit = float(thresholds.get("dominant_category_ratio", self.DOMINANT_CATEGORY_RATIO_LIMIT))
+        sim_limit = float(thresholds.get("echo_chamber_similarity", self.ECHO_CHAMBER_SIMILARITY_LIMIT))
+
+        if dom_ratio > dom_limit or avg_similarity > sim_limit:
+            exceed_ratio = max(
+                (dom_ratio - dom_limit) / max(1e-6, 1 - dom_limit),
+                (avg_similarity - sim_limit) / max(1e-6, 1 - sim_limit),
+            )
+            severity = 3 + int(np.clip(np.ceil(exceed_ratio * 2), 0, 2))
+            risks.append(
+                build_alert(
+                    risk_type=RiskType.ECHO_CHAMBER,
+                    severity=severity,
+                    brief_description="内容同质化明显，存在信息茧房倾向",
+                    detailed_description=(
+                        f"主导类别占比 {dom_ratio:.1%}（阈值 {dom_limit:.1%}），"
+                        f"平均相似度 {avg_similarity:.2f}（阈值 {sim_limit:.2f}）。"
+                    ),
+                    impact_analysis="信息输入结构单一，可能导致认知视角收窄。",
+                    key_statistics={
+                        "dominant_category": metrics.diversity.dominant_category,
+                        "dominant_category_ratio": dom_ratio,
+                        "avg_similarity": avg_similarity,
+                    },
+                    suggestions=[
+                        "主动增加学习/新闻/工具类内容比例",
+                        "每周设定至少 2 个新主题进行探索",
+                    ],
+                )
+            )
+
+        # 情绪污染：负面占比高
+        negative_ratio = float(metrics.sentiment_health.negative_ratio)
+        negative_limit = float(thresholds.get("negative_ratio_warning", self.NEGATIVE_RATIO_WARNING))
+        if negative_ratio > negative_limit:
+            exceed = (negative_ratio - negative_limit) / max(1e-6, 1 - negative_limit)
+            severity = 3 + int(np.clip(np.ceil(exceed * 2), 0, 2))
+            risks.append(
+                build_alert(
+                    risk_type=RiskType.EMOTION_POLLUTION,
+                    severity=severity,
+                    brief_description="负面内容占比较高，情绪健康受损",
+                    detailed_description=(
+                        f"负面内容占比 {negative_ratio:.1%}，超过预警阈值 {negative_limit:.1%}。"
+                    ),
+                    impact_analysis="长期暴露于负面信息可能增加焦虑与压力。",
+                    key_statistics={
+                        "negative_ratio": negative_ratio,
+                        "polarity_std": float(metrics.sentiment_health.polarity_std),
+                    },
+                    suggestions=[
+                        "降低高负面来源订阅频率",
+                        "增加中性/积极信息配比，平衡情绪负荷",
+                    ],
+                )
+            )
+
+        # 过度娱乐：娱乐内容占比高
+        entertainment_ratio = float(metrics.content_quality.entertainment_ratio)
+        entertainment_limit = float(thresholds.get("entertainment_ratio_warning", self.ENTERTAINMENT_RATIO_WARNING))
+        if entertainment_ratio > entertainment_limit:
+            exceed = (entertainment_ratio - entertainment_limit) / max(1e-6, 1 - entertainment_limit)
+            severity = 3 + int(np.clip(np.ceil(exceed * 2), 0, 2))
+            risks.append(
+                build_alert(
+                    risk_type=RiskType.EXCESSIVE_ENTERTAINMENT,
+                    severity=severity,
+                    brief_description="娱乐内容消费偏高，影响信息质量",
+                    detailed_description=(
+                        f"娱乐类占比 {entertainment_ratio:.1%}，超过预警阈值 {entertainment_limit:.1%}。"
+                    ),
+                    impact_analysis="高娱乐占比会稀释高价值信息摄入。",
+                    key_statistics={
+                        "entertainment_ratio": entertainment_ratio,
+                        "learning_ratio": float(metrics.content_quality.learning_ratio),
+                    },
+                    suggestions=[
+                        "设定娱乐内容每日时长上限",
+                        "将学习类内容固定到高注意力时段",
+                    ],
+                )
+            )
+
+        # 时间浪费：非高效时段与碎片化显著
+        off_hour_waste_ratio = float(metrics.time_allocation.off_hour_waste_ratio)
+        fragmentation_score = float(metrics.time_allocation.fragmentation_score)
+        late_night_ent_duration = float(metrics.time_allocation.late_night_entertainment_duration)
+        if off_hour_waste_ratio > 0.35 or fragmentation_score > 0.70 or late_night_ent_duration > 1.0:
+            severity = 3
+            if off_hour_waste_ratio > 0.50 or fragmentation_score > 0.85 or late_night_ent_duration > 2.0:
+                severity = 4
+            if off_hour_waste_ratio > 0.65 or late_night_ent_duration > 3.0:
+                severity = 5
+
+            risks.append(
+                build_alert(
+                    risk_type=RiskType.TIME_WASTE,
+                    severity=severity,
+                    brief_description="时间利用效率偏低，存在明显浪费",
+                    detailed_description=(
+                        f"低效时段占比 {off_hour_waste_ratio:.1%}，"
+                        f"碎片化评分 {fragmentation_score:.2f}，"
+                        f"深夜娱乐时长约 {late_night_ent_duration:.2f} 小时。"
+                    ),
+                    impact_analysis="碎片化和深夜浏览会降低专注力并压缩高质量输入时间。",
+                    key_statistics={
+                        "off_hour_waste_ratio": off_hour_waste_ratio,
+                        "fragmentation_score": fragmentation_score,
+                        "late_night_entertainment_duration": late_night_ent_duration,
+                    },
+                    suggestions=[
+                        "将高价值阅读安排在白天固定时段",
+                        "晚间设置娱乐截止时间，减少睡前连续刷屏",
+                    ],
+                )
+            )
+
+        # 内容单一：多样性分过低
+        category_diversity_score = float(metrics.diversity.category_diversity_score)
+        if category_diversity_score < 0.35:
+            severity = 4 if category_diversity_score < 0.20 else 3
+            risks.append(
+                build_alert(
+                    risk_type=RiskType.CONTENT_MONOTONY,
+                    severity=severity,
+                    brief_description="内容类别结构单一，输入广度不足",
+                    detailed_description=f"类别多样性评分为 {category_diversity_score:.2f}，低于健康建议范围。",
+                    impact_analysis="长期单一摄入不利于建立完整的信息结构。",
+                    key_statistics={
+                        "category_diversity_score": category_diversity_score,
+                        "category_count": int(metrics.diversity.category_count),
+                    },
+                    suggestions=[
+                        "按周制定跨类别内容计划（学习/新闻/工具）",
+                        "降低单一类别连续浏览时长",
+                    ],
+                )
+            )
+
+        return risks
 
     def _generate_risk_alert(
         self,
