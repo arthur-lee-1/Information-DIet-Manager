@@ -1563,31 +1563,51 @@ class InformationQualityEvaluator:
 def calculate_shannon_entropy(distribution: List[float]) -> float:
     """
     计算香农熵（衡量分布均匀度）
-
-    TODO: 实现熵计算公式
-    TODO: 处理边界情况
     """
-    pass
+    if not distribution:
+        return 0.0
+
+    entropy = 0.0
+
+    for p in distribution:
+        if p > 0:
+            entropy -= p * np.log2(p)
+    return entropy
 
 
 def normalize_score(value: float, min_val: float, max_val: float) -> float:
     """
     标准化分数到 0-1 区间
-
-    TODO: 线性归一化
-    TODO: 处理异常值
     """
-    pass
+    if max_val == min_val:  # 如果最大值和最小值相同
+        return 0.0  # 无法归一化，直接返回 0
+
+    normalized = (value - min_val) / (max_val - min_val)
+
+    if normalized < 0:
+        return 0.0
+    if normalized > 1:
+        return 1.0
+
+    return normalized
 
 
 def weighted_average(scores: Dict[str, float], weights: Dict[str, float]) -> float:
     """
     计算加权平均
-
-    TODO: 验证权重和为 1
-    TODO: 计算加权平均值
     """
-    pass
+    total_weight = sum(weights.values())
+
+    if abs(total_weight - 1.0) > 1e-6:
+        raise ValueError("权重之和必须为 1")
+
+    weighted_sum = 0.0
+
+    for key, score in scores.items():
+        weight = weights.get(key, 0.0)
+        weighted_sum += score * weight
+
+    return weighted_sum
 
 
 # ==================== 测试代码 ====================
