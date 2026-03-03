@@ -740,6 +740,52 @@ class InformationQualityEvaluator:
         logger.info(f"数据预处理完成：原始 {len(df)} 条 -> 有效 {len(processed_df)} 条")
         return processed_df
 
+    def _filter_by_time_range(
+            self,
+            df: pd.DataFrame,
+            time_range: Optional[Tuple[str, str]] = None
+    ) -> pd.DataFrame:
+        """
+        按 time_range 过滤数据（闭区间）：[start, end]
+        """
+        if time_range is None:
+            return df
+
+        if not isinstance(time_range, tuple) or len(time_range) != 2:
+            raise ValueError("time_range 必须是 (start, end) 二元组")
+
+        working_df = self._attach_timestamp_column(df)
+
+        if "timestamp" not in working_df.columns:
+            raise ValueError("指定了 time_range，但数据中没有可用时间列（timestamp/visit_time/ts）")
+
+        start = pd.to_datetime(time_range[0], errors="coerce")
+        end = pd.to_datetime(time_range[1], errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(f"time_range 解析失败: {time_range}，请使用可识别时间格式")
+        if start > end:
+            raise ValueError(f"time_range 起始时间不能晚于结束时间: start={start}, end={end}")
+
+        working_df = working_df.dropna(subset=["timestamp"]).copy()
+
+        mask = (working_df["timestamp"] >= start) & (working_df["timestamp"] <= end)
+        filtered_df = working_df.loc[mask].copy()
+
+        if filtered_df.empty:
+            raise ValueError(
+                f"time_range 过滤后无数据: [{start}, {end}]。"
+                "请检查时间范围是否覆盖到你的数据。"
+            )
+
+        filtered_df = filtered_df.sort_values("timestamp").reset_index(drop=True)
+        logger.info(
+            f"time_range 过滤完成: [{start}, {end}]，"
+            f"过滤前 {len(df)} 条 -> 过滤后 {len(filtered_df)} 条"
+        )
+
+        return filtered_df
+
     # ==================== 私有方法：多样性分析 ====================
 
     def _calculate_category_diversity(self, df: pd.DataFrame) -> float:
