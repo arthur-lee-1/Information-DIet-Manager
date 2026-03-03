@@ -1182,11 +1182,22 @@ class InformationQualityEvaluator:
                 work_mask = valid["hour"].between(9, 18)
                 off_mask = ~work_mask
 
-        TODO: 计算学习类内容的数量和时长占比
-        TODO: 对比不同时间段的变化
-        TODO: 返回详细统计
-        """
-        pass
+                work_total = int(work_mask.sum())
+                off_total = int(off_mask.sum())
+
+                if work_total > 0:
+                    working_hours_learning_ratio = float((work_mask & cat.eq("learning")).sum() / work_total)
+                if off_total > 0:
+                    off_hours_learning_ratio = float((off_mask & cat.eq("learning")).sum() / off_total)
+
+        return {
+            "learning_ratio": float(np.clip(learning_ratio, 0.0, 1.0)),
+            "learning_count": learning_count,
+            "total_count": total,
+            "working_hours_learning_ratio": float(np.clip(working_hours_learning_ratio, 0.0, 1.0)),
+            "off_hours_learning_ratio": float(np.clip(off_hours_learning_ratio, 0.0, 1.0)),
+        }
+
 
     # ==================== 私有方法：时间分配分析 ====================
 
