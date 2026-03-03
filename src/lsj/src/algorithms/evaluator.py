@@ -2116,7 +2116,7 @@ class InformationQualityEvaluator:
             metrics=metrics,
             risk_alerts=risk_alerts,
             detailed_analysis=None if not detailed else None,  # 先占位，后续再填详细分析
-            recommendations=Recommendations(),  # 先空，后续接 _generate_suggestions
+            recommendations=recommendations,
             trend_analysis=None
         )
 
