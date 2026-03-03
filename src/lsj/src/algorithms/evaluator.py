@@ -1392,11 +1392,67 @@ class InformationQualityEvaluator:
         if df.empty:
             return {"series": [], "summary": {}, "predictions": []}
 
-        TODO: 计算各指标的时间序列变化
-        TODO: 识别改善或恶化趋势
-        TODO: 预测未来风险
-        """
-        pass
+        work = self._attach_timestamp_column(df)
+        if "timestamp" not in work.columns:
+            return {"series": [], "summary": {"message": "缺少时间列"}, "predictions": []}
+
+        work = work.dropna(subset=["timestamp"]).copy()
+        if work.empty:
+            return {"series": [], "summary": {"message": "时间数据为空"}, "predictions": []}
+
+        work["date"] = work["timestamp"].dt.date.astype(str)
+        work["category_norm"] = work["category"].astype(str).str.lower().str.strip() if "category" in work.columns else "other"
+        work["polarity_num"] = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
+        work["similarity_num"] = pd.to_numeric(work.get("similarity", pd.Series(dtype=float)), errors="coerce")
+
+        records = []
+        for date_key, g in work.groupby("date"):
+            cats = g["category_norm"].value_counts(normalize=True)
+            entropy = calculate_shannon_entropy(cats.tolist()) if len(cats) > 0 else 0.0
+            max_entropy = np.log2(len(cats)) if len(cats) > 1 else 1.0
+            diversity = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+
+            negative_ratio = float((g["polarity_num"] < 0).mean()) if g["polarity_num"].notna().any() else 0.0
+            entertainment_ratio = float((g["category_norm"] == "entertainment").mean())
+            avg_similarity = float(g["similarity_num"].mean()) if g["similarity_num"].notna().any() else 0.0
+
+            records.append({
+                "date": date_key,
+                "count": int(len(g)),
+                "diversity": float(np.clip(diversity, 0.0, 1.0)),
+                "negative_ratio": float(np.clip(negative_ratio, 0.0, 1.0)),
+                "entertainment_ratio": float(np.clip(entertainment_ratio, 0.0, 1.0)),
+                "avg_similarity": float(np.clip(avg_similarity, 0.0, 1.0)),
+            })
+
+        trend_df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+        if trend_df.empty:
+            return {"series": [], "summary": {}, "predictions": []}
+
+        summary = {
+            "periods": int(len(trend_df)),
+            "avg_diversity": float(trend_df["diversity"].mean()),
+            "avg_negative_ratio": float(trend_df["negative_ratio"].mean()),
+            "avg_entertainment_ratio": float(trend_df["entertainment_ratio"].mean()),
+            "avg_similarity": float(trend_df["avg_similarity"].mean()),
+        }
+
+        predictions: List[str] = []
+        if len(trend_df) >= 3:
+            last3 = trend_df.tail(3)
+            if float(last3["negative_ratio"].mean()) > 0.4:
+                predictions.append("近期负面情绪暴露较高，建议控制负面来源。")
+            if float(last3["entertainment_ratio"].mean()) > 0.5:
+                predictions.append("近期娱乐占比较高，建议增加学习/工具类输入。")
+            if float(last3["diversity"].mean()) < 0.35:
+                predictions.append("近期信息多样性偏低，存在内容单一风险。")
+
+        return {
+            "series": trend_df.to_dict("records"),
+            "summary": summary,
+            "predictions": predictions,
+        }
+
 
     def _compare_time_periods(
         self,
