@@ -2047,6 +2047,42 @@ class InformationQualityEvaluator:
 
         risk_alerts = self._identify_risks(processed_df, metrics)
 
+        # 生成建议并按优先级落到 Recommendations
+        suggestion_texts = self._generate_suggestions(metrics, risk_alerts)
+        category_suggestions = self._generate_category_suggestions(processed_df)
+        time_suggestions = self._generate_time_management_suggestions(processed_df)
+
+        recommendation_objs: List[ActionableRecommendation] = []
+        for text in suggestion_texts:
+            recommendation_objs.append(
+                ActionableRecommendation(
+                    action=text,
+                    reason="基于风险识别自动生成",
+                    difficulty=Difficulty.EASY,
+                    expected_improvement=0.10,
+                )
+            )
+
+        recommendations = Recommendations()
+
+        # 风险建议按风险优先级分桶
+        for rec, text in zip(recommendation_objs, suggestion_texts):
+            matched_priority = None
+            for risk in sorted(risk_alerts, key=lambda r: r.severity, reverse=True):
+                if text in risk.suggestions:
+                    matched_priority = risk.priority
+                    break
+
+            if matched_priority == Priority.URGENT:
+                recommendations.urgent_recommendations.append(rec)
+            elif matched_priority == Priority.IMPORTANT:
+                recommendations.important_recommendations.append(rec)
+            else:
+                recommendations.normal_recommendations.append(rec)
+
+        recommendations.category_balance.specific_content_suggestions = category_suggestions
+        recommendations.time_management.time_slot_adjustments = time_suggestions
+
         if "timestamp" in processed_df.columns and not processed_df["timestamp"].empty:
             start_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").min()
             end_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").max()
