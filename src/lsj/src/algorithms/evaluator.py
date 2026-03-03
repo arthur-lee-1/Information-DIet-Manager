@@ -1150,6 +1150,37 @@ class InformationQualityEvaluator:
     def _analyze_learning_ratio(self, df: pd.DataFrame) -> Dict[str, float]:
         """
         分析学习类内容占比
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return {
+                "learning_ratio": 0.0,
+                "learning_count": 0.0,
+                "total_count": 0.0,
+                "working_hours_learning_ratio": 0.0,
+                "off_hours_learning_ratio": 0.0,
+            }
+
+        work = self._attach_timestamp_column(df)
+        category = work["category"].astype(str).str.lower().str.strip() if "category" in work.columns else pd.Series([], dtype=str)
+        learning_mask = category.eq("learning")
+
+        total = float(len(work))
+        learning_count = float(learning_mask.sum())
+        learning_ratio = float(learning_count / total) if total > 0 else 0.0
+
+        working_hours_learning_ratio = 0.0
+        off_hours_learning_ratio = 0.0
+
+        if "timestamp" in work.columns:
+            valid = work.dropna(subset=["timestamp"]).copy()
+            if not valid.empty:
+                valid["hour"] = valid["timestamp"].dt.hour
+                cat = valid["category"].astype(str).str.lower().str.strip()
+
+                work_mask = valid["hour"].between(9, 18)
+                off_mask = ~work_mask
 
         TODO: 计算学习类内容的数量和时长占比
         TODO: 对比不同时间段的变化
