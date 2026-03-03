@@ -1183,7 +1183,10 @@ class InformationQualityEvaluator:
                     negative_ratio=("polarity", lambda x: float((pd.to_numeric(x, errors="coerce") < 0).mean())),
                     count=("polarity", "count"),
                 ).reset_index()
-                daily_sentiment = g.to_dict("records")
+                daily_sentiment = [
+                    {str(k): v for k, v in row.items()}
+                    for row in g.to_dict("records")
+                ]
 
         return {
             "sentiment_distribution": {str(k): int(v) for k, v in sentiment_distribution.items()},
