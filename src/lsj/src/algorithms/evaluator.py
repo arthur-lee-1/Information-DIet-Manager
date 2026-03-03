@@ -2318,11 +2318,52 @@ class InformationQualityEvaluator:
                 "hourly_distribution": {},
             }
 
-        TODO: 提取关键指标的时间序列
-        TODO: 准备分布图数据
-        TODO: 生成热力图数据
-        """
-        pass
+        work = self._preprocess_data(df)
+
+        category_distribution = (
+            work["category"].astype(str).str.lower().value_counts(normalize=True).to_dict()
+            if "category" in work.columns else {}
+        )
+        sentiment_distribution = (
+            work["sentiment"].astype(str).str.lower().value_counts(normalize=True).to_dict()
+            if "sentiment" in work.columns else {}
+        )
+
+        sim = pd.to_numeric(work.get("similarity", pd.Series(dtype=float)), errors="coerce").dropna().clip(0.0, 1.0)
+        similarity_histogram = {}
+        if not sim.empty:
+            bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.01]
+            labels = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
+            bucket = pd.cut(sim, bins=bins, labels=labels, include_lowest=True, right=False)
+            similarity_histogram = {str(k): int(v) for k, v in bucket.value_counts().sort_index().to_dict().items()}
+
+        hourly_distribution = {}
+        time_series = []
+        if "timestamp" in work.columns:
+            valid = work.dropna(subset=["timestamp"]).copy()
+            if not valid.empty:
+                valid["hour"] = valid["timestamp"].dt.hour
+                valid["date"] = valid["timestamp"].dt.date.astype(str)
+
+                hourly_distribution = (
+                    valid["hour"].value_counts().sort_index().to_dict()
+                )
+
+                daily = valid.groupby("date").agg(
+                    count=("title", "count"),
+                    avg_polarity=("polarity", "mean"),
+                    avg_similarity=("similarity", "mean"),
+                ).reset_index()
+                time_series = daily.to_dict("records")
+
+        return {
+            "time_series": time_series,
+            "category_distribution": {str(k): float(v) for k, v in category_distribution.items()},
+            "sentiment_distribution": {str(k): float(v) for k, v in sentiment_distribution.items()},
+            "similarity_histogram": similarity_histogram,
+            "hourly_distribution": {int(k): int(v) for k, v in hourly_distribution.items()},
+        }
+
 
     # ==================== 报告导出 ====================
 
