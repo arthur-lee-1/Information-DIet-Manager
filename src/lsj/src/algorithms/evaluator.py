@@ -1046,35 +1046,29 @@ class InformationQualityEvaluator:
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("输入数据必须是 pandas.DataFrame")
+
         if df.empty:
             raise ValueError("输入 DataFrame 为空，无法分析时间分配")
 
         working_df = df.copy()
 
-        time_col = None
-        if "timestamp" in working_df.columns:
-            time_col = "timestamp"
-            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
-        elif "visit_time" in working_df.columns:
-            time_col = "visit_time"
-            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
-        elif "ts" in working_df.columns:
-            time_col = "ts"
-            ts_num = pd.to_numeric(working_df["ts"], errors="coerce")
+        time_col = "timestamp"
 
-            inferred_unit = "ms" if float(ts_num.dropna().median()) > 1e11 else "s"
-            working_df[time_col] = pd.to_datetime(ts_num, unit=inferred_unit, errors="coerce")
-
-        if time_col is not None:
-            working_df = working_df.dropna(subset=[time_col]).sort_values(time_col)
-            working_df["hour"] = working_df[time_col].dt.hour
-            working_df["weekday"] = working_df[time_col].dt.day_name()
+        if time_col in working_df.columns:
+            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
         else:
-            working_df["hour"] = np.nan
-            working_df["weekday"] = np.nan
+            working_df = self._attach_timestamp_column(working_df)
+
+        if time_col not in working_df.columns:
+            raise ValueError("缺少可用时间列（timestamp/visit_time/ts），无法分析时间分配")
+
+        working_df = working_df.dropna(subset=[time_col]).sort_values(time_col).copy()
 
         if working_df.empty:
             raise ValueError("可用时间数据为空，无法分析时间分配")
+
+        working_df["hour"] = working_df[time_col].dt.hour
+        working_df["weekday"] = working_df[time_col].dt.day_name()
 
         # 计算类别时间占比 在没有真实 duration 时 用记录数占比近似
         if "category" in working_df.columns:
