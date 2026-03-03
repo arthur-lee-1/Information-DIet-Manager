@@ -602,8 +602,18 @@ class InformationQualityEvaluator:
     DOMINANT_CATEGORY_RATIO_LIMIT = 0.60
     # 情感健康：负面内容占比警戒线
     NEGATIVE_RATIO_WARNING = 0.40
-    # 时间分配：娱乐内容占比警戒线
-    ENTERTAINMENT_RATIO_WARNING = 0.50
+    # 时间浪费相关阈值（用于风险判定）
+    TIME_WASTE_OFF_HOUR_WARNING = 0.35
+    TIME_WASTE_OFF_HOUR_IMPORTANT = 0.50
+    TIME_WASTE_OFF_HOUR_URGENT = 0.65
+
+    TIME_WASTE_FRAGMENT_WARNING = 0.70
+    TIME_WASTE_FRAGMENT_IMPORTANT = 0.85
+
+    TIME_WASTE_LATE_NIGHT_WARNING_HOURS = 1.0
+    TIME_WASTE_LATE_NIGHT_IMPORTANT_HOURS = 2.0
+    TIME_WASTE_LATE_NIGHT_URGENT_HOURS = 3.0
+
     # 权重
     DEFAULT_WEIGHTS = {
         "diversity": 0.25,  # 多样性权重
@@ -645,6 +655,67 @@ class InformationQualityEvaluator:
         logger.info("InformationQualityEvaluator 初始化完成")
 
     # ==================== 私有方法：数据预处理 ====================
+
+    def _normalize_existing_column(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        *,
+        to_lower: bool = True,
+        strip: bool = True,
+    ) -> pd.Series:
+        """标准化已存在列；若缺失则返回空 Series。"""
+        if column not in df.columns:
+            return pd.Series([], dtype=str)
+
+        series = df[column].astype(str)
+        if strip:
+            series = series.str.strip()
+        if to_lower:
+            series = series.str.lower()
+        return series
+
+    def _normalize_column_with_default(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        default: str,
+        *,
+        to_lower: bool = True,
+        strip: bool = True,
+    ) -> pd.Series:
+        """标准化列；若缺失则按默认值补齐到与 df 等长。"""
+        if column in df.columns:
+            return self._normalize_existing_column(df, column, to_lower=to_lower, strip=strip)
+
+        if len(df) == 0:
+            return pd.Series([], dtype=str)
+
+        fallback = str(default).strip()
+        if to_lower:
+            fallback = fallback.lower()
+        return pd.Series([fallback] * len(df), index=df.index, dtype=str)
+
+    def _compute_time_waste_severity(
+        self,
+        off_ratio: float,
+        fragmentation_score: float,
+        late_night_hours: float,
+    ) -> int:
+        """根据时间浪费相关指标计算 1-5 严重度（最低从 3 起）。"""
+        severity = 3
+        if (
+            off_ratio > self.TIME_WASTE_OFF_HOUR_IMPORTANT
+            or fragmentation_score > self.TIME_WASTE_FRAGMENT_IMPORTANT
+            or late_night_hours > self.TIME_WASTE_LATE_NIGHT_IMPORTANT_HOURS
+        ):
+            severity = 4
+        if (
+            off_ratio > self.TIME_WASTE_OFF_HOUR_URGENT
+            or late_night_hours > self.TIME_WASTE_LATE_NIGHT_URGENT_HOURS
+        ):
+            severity = 5
+        return severity
 
     def _attach_timestamp_column(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -704,10 +775,10 @@ class InformationQualityEvaluator:
         """
         processed_df = df.copy()
 
-        processed_df['title'] = processed_df['title'].astype(str).str.strip()
-        processed_df['url'] = processed_df['url'].astype(str).str.strip()
-        processed_df['category'] = processed_df['category'].astype(str).str.strip()
-        processed_df['sentiment'] = processed_df['sentiment'].astype(str).str.strip()
+        processed_df["title"] = self._normalize_existing_column(processed_df, "title", to_lower=False)
+        processed_df["url"] = self._normalize_existing_column(processed_df, "url", to_lower=False)
+        processed_df["category"] = self._normalize_existing_column(processed_df, "category")
+        processed_df["sentiment"] = self._normalize_existing_column(processed_df, "sentiment")
 
         processed_df = processed_df.dropna(subset=["category", "sentiment", "polarity", "similarity"])
 
@@ -871,9 +942,7 @@ class InformationQualityEvaluator:
         if df.empty:
             return False, 0.0, {"reason": "empty_dataframe"}
 
-        category_series = df["category"].astype(str).str.lower().str.strip() \
-            if "category" in df.columns \
-            else pd.Series([], dtype=str)
+        category_series = self._normalize_existing_column(df, "category")
 
         sim_series = pd.to_numeric(df["similarity"], errors="coerce").dropna().clip(0.0, 1.0) \
             if "similarity" in df.columns \
@@ -989,9 +1058,7 @@ class InformationQualityEvaluator:
             return False, 0.0, []
 
         work = df.copy()
-        work["category_norm"] = work["category"].astype(str).str.lower().str.strip() \
-            if "category" in work.columns \
-            else "other"
+        work["category_norm"] = self._normalize_column_with_default(work, "category", "other")
 
         polarity = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
 
@@ -1030,7 +1097,7 @@ class InformationQualityEvaluator:
             }
 
         work = df.copy()
-        sentiment_series = work["sentiment"].astype(str).str.lower().str.strip() if "sentiment" in work.columns else pd.Series([], dtype=str)
+        sentiment_series = self._normalize_existing_column(work, "sentiment")
         polarity = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
 
         sentiment_distribution = sentiment_series.value_counts(dropna=True).to_dict()
@@ -1044,8 +1111,8 @@ class InformationQualityEvaluator:
         sentiment_by_category: Dict[str, Dict[str, float]] = {}
         if {"category", "sentiment"}.issubset(work.columns):
             tmp = work.copy()
-            tmp["category"] = tmp["category"].astype(str).str.lower().str.strip()
-            tmp["sentiment"] = tmp["sentiment"].astype(str).str.lower().str.strip()
+            tmp["category"] = self._normalize_existing_column(tmp, "category")
+            tmp["sentiment"] = self._normalize_existing_column(tmp, "sentiment")
             cross = pd.crosstab(tmp["category"], tmp["sentiment"], normalize="index")
             sentiment_by_category = {
                 str(idx): {str(c): float(v) for c, v in row.items()} for idx, row in cross.iterrows()
@@ -1160,7 +1227,7 @@ class InformationQualityEvaluator:
             }
 
         work = self._attach_timestamp_column(df)
-        category = work["category"].astype(str).str.lower().str.strip() if "category" in work.columns else pd.Series([], dtype=str)
+        category = self._normalize_existing_column(work, "category")
         learning_mask = category.eq("learning")
 
         total = float(len(work))
@@ -1174,7 +1241,7 @@ class InformationQualityEvaluator:
             valid = work.dropna(subset=["timestamp"]).copy()
             if not valid.empty:
                 valid["hour"] = valid["timestamp"].dt.hour
-                cat = valid["category"].astype(str).str.lower().str.strip()
+                cat = self._normalize_existing_column(valid, "category")
 
                 work_mask = valid["hour"].between(9, 18)
                 off_mask = ~work_mask
@@ -1232,7 +1299,7 @@ class InformationQualityEvaluator:
 
         # 计算类别时间占比 在没有真实 duration 时 用记录数占比近似
         if "category" in working_df.columns:
-            category_series = working_df["category"].astype(str).str.lower().str.strip()
+            category_series = self._normalize_existing_column(working_df, "category")
             category_time_ratios = category_series.value_counts(normalize=True).to_dict()
         else:
             category_series = pd.Series(["other"] * len(working_df), index=working_df.index)
@@ -1346,11 +1413,7 @@ class InformationQualityEvaluator:
         late_night_ent = float(time_info.get("late_night_entertainment_duration", 0.0))
 
         if off_ratio > 0.35 or frag > 0.70 or late_night_ent > 1.0:
-            severity = 3
-            if off_ratio > 0.50 or frag > 0.85 or late_night_ent > 2.0:
-                severity = 4
-            if off_ratio > 0.65 or late_night_ent > 3.0:
-                severity = 5
+            severity = self._compute_time_waste_severity(off_ratio, frag, late_night_ent)
 
             alerts.append(
                 RiskAlert(
@@ -1398,7 +1461,7 @@ class InformationQualityEvaluator:
             return {"series": [], "summary": {"message": "时间数据为空"}, "predictions": []}
 
         work["date"] = work["timestamp"].dt.date.astype(str)
-        work["category_norm"] = work["category"].astype(str).str.lower().str.strip() if "category" in work.columns else "other"
+        work["category_norm"] = self._normalize_column_with_default(work, "category", "other")
         work["polarity_num"] = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
         work["similarity_num"] = pd.to_numeric(work.get("similarity", pd.Series(dtype=float)), errors="coerce")
 
@@ -1639,12 +1702,16 @@ class InformationQualityEvaluator:
         off_hour_waste_ratio = float(metrics.time_allocation.off_hour_waste_ratio)
         fragmentation_score = float(metrics.time_allocation.fragmentation_score)
         late_night_ent_duration = float(metrics.time_allocation.late_night_entertainment_duration)
-        if off_hour_waste_ratio > 0.35 or fragmentation_score > 0.70 or late_night_ent_duration > 1.0:
-            severity = 3
-            if off_hour_waste_ratio > 0.50 or fragmentation_score > 0.85 or late_night_ent_duration > 2.0:
-                severity = 4
-            if off_hour_waste_ratio > 0.65 or late_night_ent_duration > 3.0:
-                severity = 5
+        if (
+            off_hour_waste_ratio > self.TIME_WASTE_OFF_HOUR_WARNING
+            or fragmentation_score > self.TIME_WASTE_FRAGMENT_WARNING
+            or late_night_ent_duration > self.TIME_WASTE_LATE_NIGHT_WARNING_HOURS
+        ):
+            severity = self._compute_time_waste_severity(
+                off_hour_waste_ratio,
+                fragmentation_score,
+                late_night_ent_duration,
+            )
 
             risks.append(
                 build_alert(
@@ -1812,7 +1879,7 @@ class InformationQualityEvaluator:
         if df.empty or "category" not in df.columns:
             return []
 
-        category = df["category"].astype(str).str.lower().str.strip()
+        category = self._normalize_existing_column(df, "category")
         ratio = category.value_counts(normalize=True)
 
         suggestions: List[str] = []
@@ -2059,8 +2126,8 @@ class InformationQualityEvaluator:
 
     def _compute_quick_dimension_scores(self, processed_df: pd.DataFrame) -> Dict[str, float]:
         """计算快速评估四维分数（0-1）。"""
-        category_norm = processed_df["category"].astype(str).str.lower().str.strip()
-        sentiment_norm = processed_df["sentiment"].astype(str).str.lower().str.strip()
+        category_norm = self._normalize_existing_column(processed_df, "category")
+        sentiment_norm = self._normalize_existing_column(processed_df, "sentiment")
         similarity_num = pd.to_numeric(processed_df["similarity"], errors="coerce").dropna().clip(0.0, 1.0)
 
         category_counts = category_norm.value_counts()
