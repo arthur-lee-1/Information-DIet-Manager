@@ -986,7 +986,37 @@ class InformationQualityEvaluator:
         TODO: 分析访问频率和时长模式
         TODO: 返回 (是否存在, 严重程度, 问题内容列表)
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return False, 0.0, []
+
+        work = df.copy()
+        work["category_norm"] = work["category"].astype(str).str.lower().str.strip() \
+            if "category" in work.columns \
+            else "other"
+
+        polarity = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
+
+        neg_mask = polarity < -0.4
+        ent_mask = work["category_norm"].eq("entertainment")
+
+        toxic_mask = neg_mask | ent_mask
+        toxic_df = work.loc[toxic_mask].copy()
+
+        negative_ratio = float(neg_mask.mean()) if len(work) > 0 else 0.0
+        entertainment_ratio = float(ent_mask.mean()) if len(work) > 0 else 0.0
+
+        severity = float(np.clip(0.6 * negative_ratio + 0.4 * entertainment_ratio, 0.0, 1.0))
+        exists = bool((negative_ratio > 0.35) or (entertainment_ratio > 0.5))
+
+        examples: List[Dict] = []
+        if not toxic_df.empty:
+            sample_cols = [c for c in ["title", "url", "category", "sentiment", "polarity", "timestamp"] if c in toxic_df.columns]
+            for _, row in toxic_df.head(10)[sample_cols].iterrows():
+                examples.append({k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()})
+
+        return exists, severity, examples
 
     def _analyze_emotion_patterns(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
