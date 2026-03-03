@@ -1813,6 +1813,11 @@ class InformationQualityEvaluator:
     def _generate_category_suggestions(self, df: pd.DataFrame) -> List[str]:
         """
         生成类别平衡建议
+        """
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty or "category" not in df.columns:
+            return []
 
         TODO: 识别缺失或不足的类别
         TODO: 建议增加的内容类型
