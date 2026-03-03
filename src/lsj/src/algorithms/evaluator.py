@@ -861,11 +861,10 @@ class InformationQualityEvaluator:
 
     def _detect_echo_chamber(self, df: pd.DataFrame) -> Tuple[bool, float, Dict[str, Any]]:
         """
-        检测信息茧房
+        检测信息茧房（类别集中 + 高相似内容）
 
-        TODO: 综合类别集中度和内容相似度
-        TODO: 分析时间窗口内的变化趋势
-        TODO: 返回 (是否存在, 严重程度, 详细证据)
+        返回:
+            (是否存在, 严重程度0-1, 证据字典)
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas.DataFrame")
@@ -981,10 +980,8 @@ class InformationQualityEvaluator:
         """
         检测信息毒品（负面、成瘾性内容）
 
-        TODO: 识别高负面情绪内容
-        TODO: 检测娱乐内容过度消费
-        TODO: 分析访问频率和时长模式
-        TODO: 返回 (是否存在, 严重程度, 问题内容列表)
+        返回:
+            (是否存在, 严重程度0-1, 问题内容列表)
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas.DataFrame")
@@ -1462,10 +1459,6 @@ class InformationQualityEvaluator:
     ) -> Dict[str, Any]:
         """
         对比不同时间段
-
-        TODO: 计算各指标的变化率
-        TODO: 识别显著变化
-        TODO: 生成对比报告
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas.DataFrame")
@@ -1841,10 +1834,6 @@ class InformationQualityEvaluator:
     def _generate_time_management_suggestions(self, df: pd.DataFrame) -> List[str]:
         """
         生成时间管理建议
-
-        TODO: 基于时间分配分析
-        TODO: 建议调整浏览时段
-        TODO: 推荐时间管理策略
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas.DataFrame")
@@ -1880,6 +1869,223 @@ class InformationQualityEvaluator:
 
     # ==================== 核心公共方法 ====================
 
+    def _determine_health_level(self, overall_score: float) -> HealthLevel:
+        """根据综合分数映射健康等级。"""
+        if overall_score >= 90:
+            return HealthLevel.EXCELLENT
+        if overall_score >= 75:
+            return HealthLevel.GOOD
+        if overall_score >= 60:
+            return HealthLevel.FAIR
+        if overall_score >= 40:
+            return HealthLevel.WARNING
+        return HealthLevel.CRITICAL
+
+    def _build_metrics(
+        self,
+        processed_df: pd.DataFrame,
+        category_diversity_score: float,
+        content_diversity_score: float,
+        content_quality_score: float,
+        sentiment_health_score: float,
+        time_alloc: Dict[str, Any],
+    ) -> EvaluationMetrics:
+        """将各维度计算结果组装为 EvaluationMetrics。"""
+        category_counts = processed_df["category"].astype(str).str.lower().value_counts()
+        sentiment_counts = processed_df["sentiment"].astype(str).str.lower().value_counts()
+        polarity_series = pd.to_numeric(processed_df["polarity"], errors="coerce").dropna()
+
+        # 1) DiversityMetrics
+        content_div_details = self._cache.get("content_diversity_details", {})
+        category_distribution = {str(k): int(v) for k, v in category_counts.to_dict().items()}
+        category_ratios = (category_counts / category_counts.sum()).tolist() if len(category_counts) > 0 else []
+        category_entropy = calculate_shannon_entropy(category_ratios)
+
+        if len(category_counts) > 0:
+            dominant_category = str(category_counts.index[0])
+            dominant_category_ratio = float(category_counts.iloc[0] / category_counts.sum())
+        else:
+            dominant_category = "other"
+            dominant_category_ratio = 0.0
+
+        diversity_metrics = DiversityMetrics(
+            category_diversity_score=float(category_diversity_score),
+            category_count=int(len(category_counts)),
+            category_entropy=float(category_entropy),
+            dominant_category=dominant_category,
+            dominant_category_ratio=float(dominant_category_ratio),
+            content_diversity_score=float(content_diversity_score),
+            avg_similarity=float(content_div_details.get("avg_similarity", 0.0)),
+            duplicate_ratio=float(content_div_details.get("duplicate_ratio", 0.0)),
+            cluster_count=int(content_div_details.get("cluster_count", 0)),
+            category_distribution=category_distribution,
+            similarity_distribution=list(content_div_details.get("similarity_distribution", [])),
+        )
+
+        # 2) SentimentHealthMetrics
+        total_sent = max(len(processed_df), 1)
+        positive_ratio = float(sentiment_counts.get("positive", 0) / total_sent)
+        negative_ratio = float(sentiment_counts.get("negative", 0) / total_sent)
+        neutral_ratio = float(sentiment_counts.get("neutral", 0) / total_sent)
+
+        polarity_mean = float(polarity_series.mean()) if not polarity_series.empty else 0.0
+        polarity_std = float(polarity_series.std()) if len(polarity_series) >= 2 else 0.0
+        extreme_emotion_count = int((polarity_series.abs() >= 0.8).sum()) if not polarity_series.empty else 0
+
+        sentiment_metrics = SentimentHealthMetrics(
+            sentiment_health_score=float(sentiment_health_score),
+            positive_ratio=positive_ratio,
+            negative_ratio=negative_ratio,
+            neutral_ratio=neutral_ratio,
+            polarity_mean=polarity_mean,
+            polarity_std=polarity_std,
+            extreme_emotion_count=extreme_emotion_count,
+            sentiment_distribution={str(k): int(v) for k, v in sentiment_counts.to_dict().items()},
+            polarity_values=polarity_series.tolist(),
+        )
+
+        # 3) ContentQualityMetrics
+        category_ratio_map = (category_counts / category_counts.sum()).to_dict() if len(category_counts) > 0 else {}
+        content_metrics = ContentQualityMetrics(
+            content_quality_score=float(content_quality_score),
+            weighted_quality_score=float(content_quality_score),
+            learning_ratio=float(category_ratio_map.get("learning", 0.0)),
+            news_ratio=float(category_ratio_map.get("news", 0.0)),
+            tools_ratio=float(category_ratio_map.get("tools", 0.0)),
+            entertainment_ratio=float(category_ratio_map.get("entertainment", 0.0)),
+            social_ratio=float(category_ratio_map.get("social", 0.0)),
+            shopping_ratio=float(category_ratio_map.get("shopping", 0.0)),
+            other_ratio=float(category_ratio_map.get("other", 0.0)),
+            category_time_distribution={str(k): float(v) for k, v in category_ratio_map.items()},
+            category_weights={},
+        )
+
+        # 4) TimeAllocationMetrics
+        time_metrics = TimeAllocationMetrics(
+            time_allocation_score=float(time_alloc.get("time_allocation_score", 0.0)),
+            peak_hour_efficiency=float(time_alloc.get("peak_hour_efficiency", 0.0)),
+            off_hour_waste_ratio=float(time_alloc.get("off_hour_waste_ratio", 0.0)),
+            fragmentation_score=float(time_alloc.get("fragmentation_score", 0.0)),
+            avg_session_duration=float(time_alloc.get("avg_session_duration", 0.0)),
+            low_efficiency_duration=float(time_alloc.get("low_efficiency_duration", 0.0)),
+            late_night_entertainment_duration=float(time_alloc.get("late_night_entertainment_duration", 0.0)),
+            category_time_ratios=dict(time_alloc.get("category_time_ratios", {})),
+            hourly_distribution=dict(time_alloc.get("hourly_distribution", {})),
+            weekday_distribution=dict(time_alloc.get("weekday_distribution", {})),
+        )
+
+        dimension_scores = {
+            "diversity": float(diversity_metrics.category_diversity_score),
+            "sentiment_health": float(sentiment_metrics.sentiment_health_score),
+            "content_quality": float(content_metrics.content_quality_score),
+            "time_allocation": float(time_metrics.time_allocation_score),
+        }
+        overall_score = float(weighted_average(dimension_scores, self.config["weights"]) * 100)
+
+        return EvaluationMetrics(
+            diversity=diversity_metrics,
+            sentiment_health=sentiment_metrics,
+            content_quality=content_metrics,
+            time_allocation=time_metrics,
+            overall_score=overall_score,
+            dimension_weights=self.config["weights"].copy(),
+        )
+
+    def _build_recommendations(
+        self,
+        processed_df: pd.DataFrame,
+        metrics: EvaluationMetrics,
+        risk_alerts: List[RiskAlert],
+    ) -> Recommendations:
+        """将建议文本按风险优先级归类为结构化 Recommendations。"""
+        suggestion_texts = self._generate_suggestions(metrics, risk_alerts)
+        category_suggestions = self._generate_category_suggestions(processed_df)
+        time_suggestions = self._generate_time_management_suggestions(processed_df)
+
+        recommendations = Recommendations()
+
+        for text in suggestion_texts:
+            rec = ActionableRecommendation(
+                action=text,
+                reason="基于风险识别自动生成",
+                difficulty=Difficulty.EASY,
+                expected_improvement=0.10,
+            )
+
+            matched_priority = None
+            for risk in sorted(risk_alerts, key=lambda r: r.severity, reverse=True):
+                if text in risk.suggestions:
+                    matched_priority = risk.priority
+                    break
+
+            if matched_priority == Priority.URGENT:
+                recommendations.urgent_recommendations.append(rec)
+            elif matched_priority == Priority.IMPORTANT:
+                recommendations.important_recommendations.append(rec)
+            else:
+                recommendations.normal_recommendations.append(rec)
+
+        recommendations.category_balance.specific_content_suggestions = category_suggestions
+        recommendations.time_management.time_slot_adjustments = time_suggestions
+
+        return recommendations
+
+    def _build_report_metadata(self, raw_df: pd.DataFrame, processed_df: pd.DataFrame) -> ReportMetadata:
+        """构建报告元信息，统一处理时间范围与兜底逻辑。"""
+        if "timestamp" in processed_df.columns and not processed_df["timestamp"].empty:
+            start_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").min()
+            end_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").max()
+        else:
+            start_date = datetime.now()
+            end_date = datetime.now()
+
+        if pd.isna(start_date):
+            start_date = datetime.now()
+        if pd.isna(end_date):
+            end_date = datetime.now()
+
+        time_span_days = max((end_date.date() - start_date.date()).days + 1, 1)
+
+        return ReportMetadata(
+            start_date=start_date,
+            end_date=end_date,
+            total_records=int(len(raw_df)),
+            valid_records=int(len(processed_df)),
+            time_span_days=int(time_span_days),
+            generated_at=datetime.now(),
+            evaluator_version="0.1.0",
+            config_info=self.config.copy(),
+        )
+
+    def _compute_quick_dimension_scores(self, processed_df: pd.DataFrame) -> Dict[str, float]:
+        """计算快速评估四维分数（0-1）。"""
+        category_norm = processed_df["category"].astype(str).str.lower().str.strip()
+        sentiment_norm = processed_df["sentiment"].astype(str).str.lower().str.strip()
+        similarity_num = pd.to_numeric(processed_df["similarity"], errors="coerce").dropna().clip(0.0, 1.0)
+
+        category_counts = category_norm.value_counts()
+        category_probs = (category_counts / category_counts.sum()).tolist()
+        entropy = calculate_shannon_entropy(category_probs)
+        max_entropy = np.log2(len(category_probs)) if len(category_probs) > 1 else 1.0
+        diversity_score = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+        diversity_score = float(np.clip(diversity_score, 0.0, 1.0))
+
+        negative_ratio = float((sentiment_norm == "negative").mean())
+        sentiment_health_score = float(np.clip(1.0 - negative_ratio, 0.0, 1.0))
+
+        entertainment_ratio = float((category_norm == "entertainment").mean())
+        content_quality_score = float(np.clip(1.0 - entertainment_ratio, 0.0, 1.0))
+
+        avg_similarity = float(similarity_num.mean()) if not similarity_num.empty else 0.0
+        time_allocation_score = float(np.clip(1.0 - avg_similarity, 0.0, 1.0))
+
+        return {
+            "diversity": diversity_score,
+            "sentiment_health": sentiment_health_score,
+            "content_quality": content_quality_score,
+            "time_allocation": time_allocation_score,
+        }
+
     def evaluate(
         self,
         df: pd.DataFrame,
@@ -1910,206 +2116,33 @@ class InformationQualityEvaluator:
         sentiment_health_score = self._calculate_sentiment_health(df=processed_df)
         time_alloc = self._analyze_time_allocation(df=processed_df)
 
-        category_counts = processed_df["category"].astype(str).str.lower().value_counts()
-        sentiment_counts = processed_df['sentiment'].astype(str).str.lower().value_counts()
-        polarity_series = pd.to_numeric(processed_df['polarity'], errors='coerce').dropna()
-
-
-        # 构造 DiversityMetrics
-        content_div_details = self._cache.get('content_diversity_details', {})
-
-        category_distribution = {str(k): int(v) for k, v in category_counts.to_dict().items()}
-        category_ratios = (category_counts / category_counts.sum()).tolist() if len(category_counts) > 0 else []
-        category_entropy = calculate_shannon_entropy(category_ratios)
-
-        if len(category_counts) > 0:
-            dominant_category = str(category_counts.index[0])
-            dominant_category_ratio = float(category_counts.iloc[0] / category_counts.sum())
-        else:
-            dominant_category = "other"
-            dominant_category_ratio = 0.0
-
-        diversity_metrics = DiversityMetrics(
-            category_diversity_score=float(category_diversity_score),
-            category_count=int(len(category_counts)),
-            category_entropy=float(category_entropy),
-            dominant_category=dominant_category,
-            dominant_category_ratio=float(dominant_category_ratio),
-
-            content_diversity_score=float(content_diversity_score),
-            avg_similarity=float(content_div_details.get("avg_similarity", 0.0)),
-            duplicate_ratio=float(content_div_details.get("duplicate_ratio", 0.0)),
-            cluster_count=int(content_div_details.get("cluster_count", 0)),
-
-            category_distribution=category_distribution,
-            similarity_distribution=list(content_div_details.get("similarity_distribution", [])),
+        metrics = self._build_metrics(
+            processed_df=processed_df,
+            category_diversity_score=category_diversity_score,
+            content_diversity_score=content_diversity_score,
+            content_quality_score=content_quality_score,
+            sentiment_health_score=sentiment_health_score,
+            time_alloc=time_alloc,
         )
 
-        # 构造 SentimentHealthMetrics
-        total_sent = max(len(processed_df), 1)
-        positive_ratio = float(sentiment_counts.get("positive", 0) / total_sent)
-        negative_ratio = float(sentiment_counts.get("negative", 0) / total_sent)
-        neutral_ratio = float(sentiment_counts.get("neutral", 0) / total_sent)
-
-        polarity_mean = float(polarity_series.mean()) if not polarity_series.empty else 0.0
-        polarity_std = float(polarity_series.std()) if len(polarity_series) >= 2 else 0.0
-        extreme_emotion_count = int((polarity_series.abs() >= 0.8).sum()) if not polarity_series.empty else 0
-
-        sentiment_metrics = SentimentHealthMetrics(
-            sentiment_health_score=float(sentiment_health_score),
-
-            positive_ratio=positive_ratio,
-            negative_ratio=negative_ratio,
-            neutral_ratio=neutral_ratio,
-
-            polarity_mean=polarity_mean,
-            polarity_std=polarity_std,
-            extreme_emotion_count=extreme_emotion_count,
-
-            sentiment_distribution={str(k): int(v) for k, v in sentiment_counts.to_dict().items()},
-            polarity_values=polarity_series.tolist(),
-        )
-
-        # 构造 ContentQualityMetrics
-        category_ratio_map = (category_counts / category_counts.sum()).to_dict() if len(category_counts) > 0 else {}
-
-        content_metrics = ContentQualityMetrics(
-            content_quality_score=float(content_quality_score),
-            weighted_quality_score=float(content_quality_score),
-
-            learning_ratio=float(category_ratio_map.get("learning", 0.0)),
-            news_ratio=float(category_ratio_map.get("news", 0.0)),
-            tools_ratio=float(category_ratio_map.get("tools", 0.0)),
-            entertainment_ratio=float(category_ratio_map.get("entertainment", 0.0)),
-            social_ratio=float(category_ratio_map.get("social", 0.0)),
-            shopping_ratio=float(category_ratio_map.get("shopping", 0.0)),
-            other_ratio=float(category_ratio_map.get("other", 0.0)),
-
-            category_time_distribution={str(k): float(v) for k, v in category_ratio_map.items()},
-            category_weights={},
-        )
-
-        # 构造 TimeAllocationMetrics
-        time_metrics = TimeAllocationMetrics(
-            time_allocation_score=float(time_alloc.get("time_allocation_score", 0.0)),
-            peak_hour_efficiency=float(time_alloc.get("peak_hour_efficiency", 0.0)),
-            off_hour_waste_ratio=float(time_alloc.get("off_hour_waste_ratio", 0.0)),
-            fragmentation_score=float(time_alloc.get("fragmentation_score", 0.0)),
-            avg_session_duration=float(time_alloc.get("avg_session_duration", 0.0)),
-            low_efficiency_duration=float(time_alloc.get("low_efficiency_duration", 0.0)),
-            late_night_entertainment_duration=float(time_alloc.get("late_night_entertainment_duration", 0.0)),
-            category_time_ratios=dict(time_alloc.get("category_time_ratios", {})),
-            hourly_distribution=dict(time_alloc.get("hourly_distribution", {})),
-            weekday_distribution=dict(time_alloc.get("weekday_distribution", {})),
-        )
-
-        # 拼接为 EvaluationMetrics
-        dimension_scores = {
-            "diversity": float(diversity_metrics.category_diversity_score),
-            "sentiment_health": float(sentiment_metrics.sentiment_health_score),
-            "content_quality": float(content_metrics.content_quality_score),
-            "time_allocation": float(time_metrics.time_allocation_score),
-        }
-        overall_score = float(weighted_average(dimension_scores, self.config["weights"]) * 100)
-
-        metrics = EvaluationMetrics(
-            diversity=diversity_metrics,
-            sentiment_health=sentiment_metrics,
-            content_quality=content_metrics,
-            time_allocation=time_metrics,
-            overall_score=overall_score,
-            dimension_weights=self.config["weights"].copy(),
-        )
-
-        # 构造 ReportMetadata
-        if overall_score >= 90:
-            level = HealthLevel.EXCELLENT
-        elif overall_score >= 75:
-            level = HealthLevel.GOOD
-        elif overall_score >= 60:
-            level = HealthLevel.FAIR
-        elif overall_score >= 40:
-            level = HealthLevel.WARNING
-        else:
-            level = HealthLevel.CRITICAL
-
+        overall_score = float(metrics.overall_score)
+        level = self._determine_health_level(overall_score)
         health_status = HealthStatus(
             level=level,
             score=round(overall_score, 2),
             justification=(
                 f"综合评分 {overall_score:.1f}，"
-                f"多样性 {diversity_metrics.category_diversity_score * 100:.1f}，"
-                f"情感健康 {sentiment_metrics.sentiment_health_score * 100:.1f}，"
-                f"内容质量 {content_metrics.content_quality_score * 100:.1f}，"
-                f"时间分配 {time_metrics.time_allocation_score * 100:.1f}"
+                f"多样性 {metrics.diversity.category_diversity_score * 100:.1f}，"
+                f"情感健康 {metrics.sentiment_health.sentiment_health_score * 100:.1f}，"
+                f"内容质量 {metrics.content_quality.content_quality_score * 100:.1f}，"
+                f"时间分配 {metrics.time_allocation.time_allocation_score * 100:.1f}"
             )
         )
 
         risk_alerts = self._identify_risks(processed_df, metrics)
+        recommendations = self._build_recommendations(processed_df, metrics, risk_alerts)
+        metadata = self._build_report_metadata(df, processed_df)
 
-        # 生成建议并按优先级落到 Recommendations
-        suggestion_texts = self._generate_suggestions(metrics, risk_alerts)
-        category_suggestions = self._generate_category_suggestions(processed_df)
-        time_suggestions = self._generate_time_management_suggestions(processed_df)
-
-        recommendation_objs: List[ActionableRecommendation] = []
-        for text in suggestion_texts:
-            recommendation_objs.append(
-                ActionableRecommendation(
-                    action=text,
-                    reason="基于风险识别自动生成",
-                    difficulty=Difficulty.EASY,
-                    expected_improvement=0.10,
-                )
-            )
-
-        recommendations = Recommendations()
-
-        # 风险建议按风险优先级分桶
-        for rec, text in zip(recommendation_objs, suggestion_texts):
-            matched_priority = None
-            for risk in sorted(risk_alerts, key=lambda r: r.severity, reverse=True):
-                if text in risk.suggestions:
-                    matched_priority = risk.priority
-                    break
-
-            if matched_priority == Priority.URGENT:
-                recommendations.urgent_recommendations.append(rec)
-            elif matched_priority == Priority.IMPORTANT:
-                recommendations.important_recommendations.append(rec)
-            else:
-                recommendations.normal_recommendations.append(rec)
-
-        recommendations.category_balance.specific_content_suggestions = category_suggestions
-        recommendations.time_management.time_slot_adjustments = time_suggestions
-
-        if "timestamp" in processed_df.columns and not processed_df["timestamp"].empty:
-            start_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").min()
-            end_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").max()
-        else:
-            # 没有时间列时，用当前时间兜底
-            start_date = datetime.now()
-            end_date = datetime.now()
-
-        if pd.isna(start_date):
-            start_date = datetime.now()
-        if pd.isna(end_date):
-            end_date = datetime.now()
-
-        time_span_days = max((end_date.date() - start_date.date()).days + 1, 1)
-
-        metadata = ReportMetadata(
-            start_date=start_date,
-            end_date=end_date,
-            total_records=int(len(df)),
-            valid_records=int(len(processed_df)),
-            time_span_days=int(time_span_days),
-            generated_at=datetime.now(),
-            evaluator_version="0.1.0",
-            config_info=self.config.copy()
-        )
-
-        # 组装 EvaluationReport
         report = EvaluationReport(
             metadata=metadata,
             health_status=health_status,
@@ -2117,7 +2150,7 @@ class InformationQualityEvaluator:
             risk_alerts=risk_alerts,
             detailed_analysis=None if not detailed else None,  # 先占位，后续再填详细分析
             recommendations=recommendations,
-            trend_analysis=None
+            trend_analysis=None,
         )
 
         self.last_report = report
@@ -2130,50 +2163,20 @@ class InformationQualityEvaluator:
         self._validate_dataframe(df)
         processed_df = self._preprocess_data(df)
 
-        category_counts = processed_df["category"].value_counts()
-        category_probs = (category_counts / category_counts.sum()).tolist()
-        entropy = calculate_shannon_entropy(category_probs)
-        max_entropy = np.log2(len(category_probs)) if len(category_probs) > 1 else 1.0
-        diversity_score = float(entropy / max_entropy) if max_entropy > 0 else 0.0
-        diversity_score = float(np.clip(diversity_score, 0.0, 1.0))
-
-        negative_ratio = float((processed_df["sentiment"] == "negative").mean())
-        sentiment_health_score = float(np.clip(1.0 - negative_ratio, 0.0, 1.0))
-
-        entertainment_ratio = float((processed_df["category"] == "entertainment").mean())
-        content_quality_score = float(np.clip(1.0 - entertainment_ratio, 0.0, 1.0))
-
-        avg_similarity = float(processed_df["similarity"].mean())
-        time_allocation_score = float(np.clip(1.0 - avg_similarity, 0.0, 1.0))
-
-        dimension_scores = {
-            "diversity": diversity_score,
-            "sentiment_health": sentiment_health_score,
-            "content_quality": content_quality_score,
-            "time_allocation": time_allocation_score,
-        }
+        dimension_scores = self._compute_quick_dimension_scores(processed_df)
         overall_0_1 = weighted_average(dimension_scores, self.config["weights"])
         overall_score = round(overall_0_1 * 100, 2)
 
-        if overall_score >= 90:
-            level = HealthLevel.EXCELLENT.value
-        elif overall_score >= 75:
-            level = HealthLevel.GOOD.value
-        elif overall_score >= 60:
-            level = HealthLevel.FAIR.value
-        elif overall_score >= 40:
-            level = HealthLevel.WARNING.value
-        else:
-            level = HealthLevel.CRITICAL.value
+        level = self._determine_health_level(overall_score).value
 
         return {
             "overall_score": overall_score,
             "health_level": level,
             "dimension_scores": {
-                "diversity": round(diversity_score * 100, 2),
-                "sentiment_health": round(sentiment_health_score * 100, 2),
-                "content_quality": round(content_quality_score * 100, 2),
-                "time_allocation": round(time_allocation_score * 100, 2),
+                "diversity": round(dimension_scores["diversity"] * 100, 2),
+                "sentiment_health": round(dimension_scores["sentiment_health"] * 100, 2),
+                "content_quality": round(dimension_scores["content_quality"] * 100, 2),
+                "time_allocation": round(dimension_scores["time_allocation"] * 100, 2),
             },
             "sample_info": {
                 "total_records": int(len(df)),
@@ -2190,10 +2193,6 @@ class InformationQualityEvaluator:
     ) -> pd.DataFrame:
         """
         批量评估（按时间段分组）
-
-        TODO: 按指定维度分组
-        TODO: 对每组执行评估
-        TODO: 返回评估结果 DataFrame
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas.DataFrame")
