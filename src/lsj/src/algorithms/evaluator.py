@@ -1708,6 +1708,9 @@ class InformationQualityEvaluator:
     ) -> RiskAlert:
         """
         生成单个风险警报
+        """
+        severity = int(np.clip(severity, 1, 5))
+        priority = Priority.URGENT if severity >= 5 else Priority.IMPORTANT if severity >= 4 else Priority.NORMAL
 
         TODO: 根据风险类型生成描述
         TODO: 提取关键证据
