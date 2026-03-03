@@ -1712,11 +1712,64 @@ class InformationQualityEvaluator:
         severity = int(np.clip(severity, 1, 5))
         priority = Priority.URGENT if severity >= 5 else Priority.IMPORTANT if severity >= 4 else Priority.NORMAL
 
-        TODO: 根据风险类型生成描述
-        TODO: 提取关键证据
-        TODO: 生成针对性建议
-        """
-        pass
+        templates = {
+            RiskType.ECHO_CHAMBER: {
+                "brief": "存在信息茧房倾向",
+                "detail": "内容来源或主题过于集中，且相似内容占比较高。",
+                "impact": "可能导致视角收窄与判断偏差。",
+                "suggestions": ["扩展不同领域信息源", "主动阅读与既有偏好相反的观点"],
+            },
+            RiskType.TOXIC_CONTENT: {
+                "brief": "存在信息毒品风险",
+                "detail": "负面或高刺激内容暴露较多。",
+                "impact": "可能增加情绪负担并影响注意力。",
+                "suggestions": ["减少高刺激内容连续浏览", "提高高质量内容占比"],
+            },
+            RiskType.TIME_WASTE: {
+                "brief": "存在时间浪费风险",
+                "detail": "低效时段使用偏高或碎片化明显。",
+                "impact": "会挤压高质量输入与休息时间。",
+                "suggestions": ["固定专注时段", "设置晚间浏览截止时间"],
+            },
+            RiskType.EMOTION_POLLUTION: {
+                "brief": "存在情绪污染风险",
+                "detail": "负面内容比例偏高。",
+                "impact": "可能导致焦虑、疲惫等负面体验。",
+                "suggestions": ["降低负面来源订阅频率", "增加中性/积极内容"],
+            },
+            RiskType.CONTENT_MONOTONY: {
+                "brief": "内容结构单一",
+                "detail": "类别多样性不足。",
+                "impact": "信息面窄，不利于综合判断。",
+                "suggestions": ["制定跨类别摄入计划", "减少单一类别连续阅读"],
+            },
+            RiskType.EXCESSIVE_ENTERTAINMENT: {
+                "brief": "娱乐消费过高",
+                "detail": "娱乐内容占比超过建议范围。",
+                "impact": "可能影响学习与深度思考投入。",
+                "suggestions": ["设定娱乐时长上限", "将学习内容前置"],
+            },
+        }
+
+        tpl = templates.get(risk_type, {
+            "brief": "发现潜在风险",
+            "detail": "检测到异常模式。",
+            "impact": "建议及时调整信息摄取策略。",
+            "suggestions": ["关注近期行为变化", "适度调整内容结构"],
+        })
+
+        return RiskAlert(
+            risk_type=risk_type,
+            severity=severity,
+            brief_description=tpl["brief"],
+            detailed_description=tpl["detail"],
+            evidence=Evidence(key_statistics=evidence or {}),
+            impact_analysis=tpl["impact"],
+            potential_consequences=[],
+            suggestions=list(tpl["suggestions"]),
+            priority=priority,
+        )
+
 
     # ==================== 私有方法：建议生成 ====================
 
