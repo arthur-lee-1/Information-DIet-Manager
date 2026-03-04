@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 # 避免循环导入
 if TYPE_CHECKING:
-    from ..evaluator import (
+    from lsj.src.algorithms.evaluator import (
         EvaluationReport, HealthLevel, RiskAlert,
         ActionableRecommendation, DiversityMetrics,
         SentimentHealthMetrics, ContentQualityMetrics,

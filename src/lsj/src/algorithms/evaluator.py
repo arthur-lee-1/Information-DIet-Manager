@@ -20,13 +20,12 @@ from datetime import datetime
 
 import pandas as pd
 import numpy as np
-from pandas import to_numeric
 
 # 导入已完成的模块
 from sentiment import SentimentAnalyzer
 from classifier import ContentClassifier
 from similarity import SimilarityAnalyzer
-from .utils.markdown_builder import ReportMarkdownGenerator
+from markdown_builder import ReportMarkdownGenerator
 
 
 # ========= Logger 初始化 =========
@@ -207,6 +206,45 @@ class EvaluationMetrics:
         'content_quality': 0.30,
         'time_allocation': 0.20
     })
+
+
+# 默认阈值与权重
+DEFAULT_THRESHOLDS: Dict[str, float] = {
+    "echo_chamber_similarity": 0.75,
+    "dominant_category_ratio": 0.60,
+    "negative_ratio_warning": 0.40,
+    "entertainment_ratio_warning": 0.50,
+    "time_waste_off_hour_warning": 0.35,
+    "time_waste_off_hour_important": 0.50,
+    "time_waste_off_hour_urgent": 0.65,
+    "time_waste_fragment_warning": 0.70,
+    "time_waste_fragment_important": 0.85,
+    "time_waste_late_night_warning_hours": 1.0,
+    "time_waste_late_night_important_hours": 2.0,
+    "time_waste_late_night_urgent_hours": 3.0,
+}
+
+DEFAULT_WEIGHTS: Dict[str, float] = {
+    "diversity": 0.25,
+    "sentiment_health": 0.25,
+    "content_quality": 0.30,
+    "time_allocation": 0.20,
+}
+
+
+@dataclass
+class EvaluatorConfig:
+    """评估器配置（统一管理阈值与权重）。"""
+    min_records: int = 5
+    thresholds: Dict[str, float] = field(default_factory=lambda: DEFAULT_THRESHOLDS.copy())
+    weights: Dict[str, float] = field(default_factory=lambda: DEFAULT_WEIGHTS.copy())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "min_records": int(self.min_records),
+            "thresholds": {str(k): float(v) for k, v in self.thresholds.items()},
+            "weights": {str(k): float(v) for k, v in self.weights.items()},
+        }
 
 
 # ==================== 风险警报数据类 ====================
@@ -499,9 +537,9 @@ class EvaluationReport:
 
             if is_dataclass(obj):
                 result = {}
-                for filed in fields(obj):
-                    value = getattr(obj, filed.name)
-                    result[filed.name] = dataclass_to_dict(value)
+                for field_def in fields(obj):
+                    value = getattr(obj, field_def.name)
+                    result[field_def.name] = dataclass_to_dict(value)
                 return result
 
             # 处理枚举
@@ -595,30 +633,12 @@ class InformationQualityEvaluator:
         4. 生成综合评估报告
     """
 
-    # ==================== 类常量 ====================
-    # 定义阈值常量
-    # 信息茧房：平均相似度阈值
-    ECHO_CHAMBER_SIMILARITY_LIMIT = 0.75
-    # 信息茧房：主导类别占比阈值
-    DOMINANT_CATEGORY_RATIO_LIMIT = 0.60
-    # 情感健康：负面内容占比警戒线
-    NEGATIVE_RATIO_WARNING = 0.40
-    # 时间分配：娱乐内容占比警戒线
-    ENTERTAINMENT_RATIO_WARNING = 0.50
-    # 权重
-    DEFAULT_WEIGHTS = {
-        "diversity": 0.25,  # 多样性权重
-        "sentiment_health": 0.25,  # 情感健康权重
-        "content_quality": 0.30,  # 内容质量权重
-        "time_allocation": 0.20  # 时间分配权重
-    }
-
     def __init__(
         self,
         sentiment_analyzer: Optional[SentimentAnalyzer] = None,
         content_classifier: Optional[ContentClassifier] = None,
         similarity_analyzer: Optional[SimilarityAnalyzer] = None,
-        config: Optional[Dict[str, Any]] = None
+        config: Optional[Any] = None
     ):
         """
         初始化评估器
@@ -636,8 +656,12 @@ class InformationQualityEvaluator:
 
         # 加载配置（阈值、权重、评分规则）
         self.config = self.get_default_config()
-        if config is not None:
+        if isinstance(config, EvaluatorConfig):
+            self.config = config
+        elif isinstance(config, dict):
             self.update_config(config)
+        elif config is not None:
+            raise TypeError("config 必须是 dict、EvaluatorConfig 或 None")
 
         # 初始化缓存和状态变量
         self._cache : Dict[str, Any] = {}
@@ -646,6 +670,145 @@ class InformationQualityEvaluator:
         logger.info("InformationQualityEvaluator 初始化完成")
 
     # ==================== 私有方法：数据预处理 ====================
+
+    def _normalize_existing_column(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        *,
+        to_lower: bool = True,
+        strip: bool = True,
+    ) -> pd.Series:
+        """标准化已存在列；若缺失则返回空 Series。"""
+        if column not in df.columns:
+            return pd.Series([], dtype=str)
+
+        series = df[column].astype(str)
+        if strip:
+            series = series.str.strip()
+        if to_lower:
+            series = series.str.lower()
+        return series
+
+    def _normalize_column_with_default(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        default: str,
+        *,
+        to_lower: bool = True,
+        strip: bool = True,
+    ) -> pd.Series:
+        """标准化列；若缺失则按默认值补齐到与 df 等长。"""
+        if column in df.columns:
+            return self._normalize_existing_column(df, column, to_lower=to_lower, strip=strip)
+
+        if len(df) == 0:
+            return pd.Series([], dtype=str)
+
+        fallback = str(default).strip()
+        if to_lower:
+            fallback = fallback.lower()
+        return pd.Series([fallback] * len(df), index=df.index, dtype=str)
+
+    def _compute_time_waste_severity(
+        self,
+        off_ratio: float,
+        fragmentation_score: float,
+        late_night_hours: float,
+    ) -> int:
+        """根据时间浪费相关指标计算 1-5 严重度（最低从 3 起）。"""
+        severity = 3
+        if (
+            off_ratio > self._get_threshold("time_waste_off_hour_important")
+            or fragmentation_score > self._get_threshold("time_waste_fragment_important")
+            or late_night_hours > self._get_threshold("time_waste_late_night_important_hours")
+        ):
+            severity = 4
+        if (
+            off_ratio > self._get_threshold("time_waste_off_hour_urgent")
+            or late_night_hours > self._get_threshold("time_waste_late_night_urgent_hours")
+        ):
+            severity = 5
+        return severity
+
+    def _get_threshold(self, key: str, default: Optional[float] = None) -> float:
+        """从配置中读取阈值，缺失时回退到默认值。"""
+        if default is None:
+            default = DEFAULT_THRESHOLDS.get(key, 0.0)
+        return float(self.config.thresholds.get(key, default))
+
+    def _build_score_row(
+        self,
+        result: Dict[str, Any],
+        *,
+        id_key: str,
+        id_value: Any,
+    ) -> Dict[str, Any]:
+        """将 quick_evaluate 结果组装为统一行结构。"""
+        dims = result["dimension_scores"]
+        row = {
+            id_key: str(id_value),
+            "overall_score": float(result["overall_score"]),
+            "health_level": result["health_level"],
+            "diversity": float(dims["diversity"]),
+            "sentiment_health": float(dims["sentiment_health"]),
+            "content_quality": float(dims["content_quality"]),
+            "time_allocation": float(dims["time_allocation"]),
+            "total_records": int(result["sample_info"]["total_records"]),
+            "valid_records": int(result["sample_info"]["valid_records"]),
+        }
+        return row
+
+    def _build_alert(
+        self,
+        risk_type: RiskType,
+        severity: int,
+        brief_description: str,
+        detailed_description: str,
+        impact_analysis: str,
+        key_statistics: Dict[str, Any],
+        suggestions: List[str],
+        potential_consequences: Optional[List[str]] = None,
+    ) -> RiskAlert:
+        """统一构建 RiskAlert，集中处理严重度与优先级。"""
+        severity = int(np.clip(severity, 1, 5))
+        priority = Priority.URGENT if severity >= 5 else Priority.IMPORTANT if severity >= 4 else Priority.NORMAL
+        return RiskAlert(
+            risk_type=risk_type,
+            severity=severity,
+            brief_description=brief_description,
+            detailed_description=detailed_description,
+            evidence=Evidence(key_statistics=key_statistics),
+            impact_analysis=impact_analysis,
+            potential_consequences=potential_consequences or [],
+            suggestions=suggestions,
+            priority=priority,
+        )
+
+    def _attach_timestamp_column(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        统一时间字段到 timestamp 列
+        支持输入列: timestamp / visit_time / ts
+        """
+        working_df = df.copy()
+        parsed_ts = None
+
+        if "timestamp" in working_df.columns:
+            parsed_ts = pd.to_datetime(working_df["timestamp"], errors="coerce")
+        elif "visit_time" in working_df.columns:
+            parsed_ts = pd.to_datetime(working_df["visit_time"], errors="coerce")
+        elif "ts" in working_df.columns:
+            ts_num = pd.to_numeric(working_df["ts"], errors="coerce")
+            if ts_num.notna().any():
+                inferred_unit = "ms" if float(ts_num.dropna().median()) > 1e11 else "s"
+                parsed_ts = pd.to_datetime(ts_num, unit=inferred_unit, errors="coerce")
+            else:
+                parsed_ts = pd.to_datetime(working_df["ts"], errors="coerce")
+
+        if parsed_ts is not None:
+            working_df["timestamp"] = parsed_ts
+        return working_df
 
     def _validate_dataframe(self, df: pd.DataFrame) -> bool:
         """
@@ -656,8 +819,8 @@ class InformationQualityEvaluator:
             raise TypeError("输入数据必须是 pandas.DataFrame")
 
         if df.empty:
-           logger.error("输入 DataFrame 为空，无法评估")
-           raise ValueError("输入 DataFrame 为空，无法评估")
+            logger.error("输入 DataFrame 为空，无法评估")
+            raise ValueError("输入 DataFrame 为空，无法评估")
 
         required_columns = {"title", "url", "category", "sentiment", "polarity", "similarity"}
         missing_columns = sorted(required_columns - set(df.columns))
@@ -666,7 +829,7 @@ class InformationQualityEvaluator:
             logger.error(f"缺少必需列: {missing_columns}")
             raise ValueError(f"缺少必需列: {missing_columns}")
 
-        min_records = int(self.config.get('min_records', 5))
+        min_records = int(self.config.min_records)
 
         if len(df) < min_records:
             logger.warning(f"样本量不足：当前 {len(df)} 条，至少需要 {min_records} 条")
@@ -681,10 +844,10 @@ class InformationQualityEvaluator:
         """
         processed_df = df.copy()
 
-        processed_df['title'] = processed_df['title'].astype(str).str.strip()
-        processed_df['url'] = processed_df['url'].astype(str).str.strip()
-        processed_df['category'] = processed_df['category'].astype(str).str.strip()
-        processed_df['sentiment'] = processed_df['sentiment'].astype(str).str.strip()
+        processed_df["title"] = self._normalize_existing_column(processed_df, "title", to_lower=False)
+        processed_df["url"] = self._normalize_existing_column(processed_df, "url", to_lower=False)
+        processed_df["category"] = self._normalize_existing_column(processed_df, "category")
+        processed_df["sentiment"] = self._normalize_existing_column(processed_df, "sentiment")
 
         processed_df = processed_df.dropna(subset=["category", "sentiment", "polarity", "similarity"])
 
@@ -696,12 +859,11 @@ class InformationQualityEvaluator:
         processed_df["polarity"] = processed_df["polarity"].clip(-1.0, 1.0)
         processed_df["similarity"] = processed_df["similarity"].clip(0.0, 1.0)
 
-        if 'timestamp' in processed_df.columns:
-            processed_df['timestamp'] = pd.to_datetime(processed_df['timestamp'], errors='coerce')
+        processed_df = self._attach_timestamp_column(processed_df)
 
-            processed_df = processed_df.dropna(subset=['timestamp'])
-
-            processed_df = processed_df.sort_values(by=['timestamp'], ascending=True)
+        if "timestamp" in processed_df.columns:
+            processed_df = processed_df.dropna(subset=["timestamp"])
+            processed_df = processed_df.sort_values(by=["timestamp"], ascending=True)
 
             processed_df["date"] = processed_df["timestamp"].dt.date
             processed_df["hour"] = processed_df["timestamp"].dt.hour
@@ -709,7 +871,7 @@ class InformationQualityEvaluator:
 
         processed_df = processed_df.reset_index(drop=True)
 
-        min_records = int(self.config.get("min_records", 5))
+        min_records = int(self.config.min_records)
         if len(processed_df) < min_records:
             raise ValueError(
                 f"预处理后有效样本不足：当前 {len(processed_df)} 条，至少需要 {min_records} 条"
@@ -717,6 +879,52 @@ class InformationQualityEvaluator:
 
         logger.info(f"数据预处理完成：原始 {len(df)} 条 -> 有效 {len(processed_df)} 条")
         return processed_df
+
+    def _filter_by_time_range(
+            self,
+            df: pd.DataFrame,
+            time_range: Optional[Tuple[str, str]] = None
+    ) -> pd.DataFrame:
+        """
+        按 time_range 过滤数据（闭区间）：[start, end]
+        """
+        if time_range is None:
+            return df
+
+        if not isinstance(time_range, tuple) or len(time_range) != 2:
+            raise ValueError("time_range 必须是 (start, end) 二元组")
+
+        working_df = self._attach_timestamp_column(df)
+
+        if "timestamp" not in working_df.columns:
+            raise ValueError("指定了 time_range，但数据中没有可用时间列（timestamp/visit_time/ts）")
+
+        start = pd.to_datetime(time_range[0], errors="coerce")
+        end = pd.to_datetime(time_range[1], errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(f"time_range 解析失败: {time_range}，请使用可识别时间格式")
+        if start > end:
+            raise ValueError(f"time_range 起始时间不能晚于结束时间: start={start}, end={end}")
+
+        working_df = working_df.dropna(subset=["timestamp"]).copy()
+
+        mask = (working_df["timestamp"] >= start) & (working_df["timestamp"] <= end)
+        filtered_df = working_df.loc[mask].copy()
+
+        if filtered_df.empty:
+            raise ValueError(
+                f"time_range 过滤后无数据: [{start}, {end}]。"
+                "请检查时间范围是否覆盖到你的数据。"
+            )
+
+        filtered_df = filtered_df.sort_values("timestamp").reset_index(drop=True)
+        logger.info(
+            f"time_range 过滤完成: [{start}, {end}]，"
+            f"过滤前 {len(df)} 条 -> 过滤后 {len(filtered_df)} 条"
+        )
+
+        return filtered_df
 
     # ==================== 私有方法：多样性分析 ====================
 
@@ -793,13 +1001,54 @@ class InformationQualityEvaluator:
 
     def _detect_echo_chamber(self, df: pd.DataFrame) -> Tuple[bool, float, Dict[str, Any]]:
         """
-        检测信息茧房
+        检测信息茧房（类别集中 + 高相似内容）
 
-        TODO: 综合类别集中度和内容相似度
-        TODO: 分析时间窗口内的变化趋势
-        TODO: 返回 (是否存在, 严重程度, 详细证据)
+        返回:
+            (是否存在, 严重程度0-1, 证据字典)
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return False, 0.0, {"reason": "empty_dataframe"}
+
+        category_series = self._normalize_existing_column(df, "category")
+
+        sim_series = pd.to_numeric(df["similarity"], errors="coerce").dropna().clip(0.0, 1.0) \
+            if "similarity" in df.columns \
+            else pd.Series([], dtype=float)
+
+        if category_series.empty:
+            dominant_ratio = 0.0
+            dominant_category = "other"
+        else:
+            counts = category_series.value_counts()
+            dominant_category = str(counts.index[0])
+            dominant_ratio = float(counts.iloc[0] / counts.sum())
+
+        avg_similarity = float(sim_series.mean()) if not sim_series.empty else 0.0
+        high_similarity_ratio = float((sim_series >= 0.85).mean()) if not sim_series.empty else 0.0
+
+        dom_limit = self._get_threshold("dominant_category_ratio")
+        sim_limit = self._get_threshold("echo_chamber_similarity")
+
+        dom_exceed = max(0.0, (dominant_ratio - dom_limit) / max(1e-6, 1.0 - dom_limit))
+        sim_exceed = max(0.0, (avg_similarity - sim_limit) / max(1e-6, 1.0 - sim_limit))
+
+        severity = float(np.clip(0.55 * dom_exceed + 0.45 * sim_exceed, 0.0, 1.0))
+        exists = bool((dominant_ratio > dom_limit) or (avg_similarity > sim_limit))
+
+        evidence = {
+            "dominant_category": dominant_category,
+            "dominant_category_ratio": dominant_ratio,
+            "dominant_ratio_limit": dom_limit,
+            "avg_similarity": avg_similarity,
+            "similarity_limit": sim_limit,
+            "high_similarity_ratio": high_similarity_ratio,
+            "record_count": int(len(df)),
+        }
+
+        return exists, severity, evidence
+
 
     # ==================== 私有方法：情感健康分析 ====================
 
@@ -818,7 +1067,7 @@ class InformationQualityEvaluator:
             logger.error("输入数据必须是 pandas.DataFrame")
             raise TypeError("输入数据必须是 pandas.DataFrame")
 
-        if df.empty or df is None:
+        if df.empty:
             logger.error("输入 DataFrame 为空，无法评估")
             raise ValueError("输入 DataFrame 为空，无法评估")
 
@@ -869,22 +1118,98 @@ class InformationQualityEvaluator:
         """
         检测信息毒品（负面、成瘾性内容）
 
-        TODO: 识别高负面情绪内容
-        TODO: 检测娱乐内容过度消费
-        TODO: 分析访问频率和时长模式
-        TODO: 返回 (是否存在, 严重程度, 问题内容列表)
+        返回:
+            (是否存在, 严重程度0-1, 问题内容列表)
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return False, 0.0, []
+
+        work = df.copy()
+        work["category_norm"] = self._normalize_column_with_default(work, "category", "other")
+
+        polarity = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
+
+        neg_mask = polarity < -0.4
+        ent_mask = work["category_norm"].eq("entertainment")
+
+        toxic_mask = neg_mask | ent_mask
+        toxic_df = work.loc[toxic_mask].copy()
+
+        negative_ratio = float(neg_mask.mean()) if len(work) > 0 else 0.0
+        entertainment_ratio = float(ent_mask.mean()) if len(work) > 0 else 0.0
+
+        severity = float(np.clip(0.6 * negative_ratio + 0.4 * entertainment_ratio, 0.0, 1.0))
+        exists = bool((negative_ratio > 0.35) or (entertainment_ratio > 0.5))
+
+        examples: List[Dict] = []
+        if not toxic_df.empty:
+            sample_cols = [c for c in ["title", "url", "category", "sentiment", "polarity", "timestamp"] if c in toxic_df.columns]
+            for _, row in toxic_df.head(10)[sample_cols].iterrows():
+                examples.append({k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()})
+
+        return exists, severity, examples
 
     def _analyze_emotion_patterns(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         分析情绪模式
-
-        TODO: 统计各类情绪的分布
-        TODO: 分析情绪随时间的变化
-        TODO: 识别情绪触发因素（类别、时间段）
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return {
+                "sentiment_distribution": {},
+                "polarity_stats": {},
+                "sentiment_by_category": {},
+                "daily_sentiment": [],
+            }
+
+        work = df.copy()
+        sentiment_series = self._normalize_existing_column(work, "sentiment")
+        polarity = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
+
+        sentiment_distribution = sentiment_series.value_counts(dropna=True).to_dict()
+        polarity_stats = {
+            "mean": float(polarity.mean()) if polarity.notna().any() else 0.0,
+            "std": float(polarity.std()) if polarity.notna().sum() > 1 else 0.0,
+            "min": float(polarity.min()) if polarity.notna().any() else 0.0,
+            "max": float(polarity.max()) if polarity.notna().any() else 0.0,
+        }
+
+        sentiment_by_category: Dict[str, Dict[str, float]] = {}
+        if {"category", "sentiment"}.issubset(work.columns):
+            tmp = work.copy()
+            tmp["category"] = self._normalize_existing_column(tmp, "category")
+            tmp["sentiment"] = self._normalize_existing_column(tmp, "sentiment")
+            cross = pd.crosstab(tmp["category"], tmp["sentiment"], normalize="index")
+            sentiment_by_category = {
+                str(idx): {str(c): float(v) for c, v in row.items()} for idx, row in cross.iterrows()
+            }
+
+        daily_sentiment: List[Dict[str, Any]] = []
+        work = self._attach_timestamp_column(work)
+        if "timestamp" in work.columns:
+            valid = work.dropna(subset=["timestamp"]).copy()
+            if not valid.empty and "polarity" in valid.columns:
+                valid["date"] = valid["timestamp"].dt.date.astype(str)
+                g = valid.groupby("date").agg(
+                    mean_polarity=("polarity", "mean"),
+                    negative_ratio=("polarity", lambda x: float((pd.to_numeric(x, errors="coerce") < 0).mean())),
+                    count=("polarity", "count"),
+                ).reset_index()
+                daily_sentiment = [
+                    {str(k): v for k, v in row.items()}
+                    for row in g.to_dict("records")
+                ]
+
+        return {
+            "sentiment_distribution": {str(k): int(v) for k, v in sentiment_distribution.items()},
+            "polarity_stats": polarity_stats,
+            "sentiment_by_category": sentiment_by_category,
+            "daily_sentiment": daily_sentiment,
+        }
+
 
     # ==================== 私有方法：内容质量分析 ====================
 
@@ -902,7 +1227,7 @@ class InformationQualityEvaluator:
             logger.error("输入数据必须是 pandas.DataFrame")
             raise TypeError("输入数据必须是 pandas.DataFrame")
 
-        if df.empty or df is None:
+        if df.empty:
             logger.error("输入 DataFrame 为空，无法计算内容质量分数")
             raise ValueError("输入 DataFrame 为空，无法计算内容质量分数")
 
@@ -961,12 +1286,54 @@ class InformationQualityEvaluator:
     def _analyze_learning_ratio(self, df: pd.DataFrame) -> Dict[str, float]:
         """
         分析学习类内容占比
-
-        TODO: 计算学习类内容的数量和时长占比
-        TODO: 对比不同时间段的变化
-        TODO: 返回详细统计
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return {
+                "learning_ratio": 0.0,
+                "learning_count": 0.0,
+                "total_count": 0.0,
+                "working_hours_learning_ratio": 0.0,
+                "off_hours_learning_ratio": 0.0,
+            }
+
+        work = self._attach_timestamp_column(df)
+        category = self._normalize_existing_column(work, "category")
+        learning_mask = category.eq("learning")
+
+        total = float(len(work))
+        learning_count = float(learning_mask.sum())
+        learning_ratio = float(learning_count / total) if total > 0 else 0.0
+
+        working_hours_learning_ratio = 0.0
+        off_hours_learning_ratio = 0.0
+
+        if "timestamp" in work.columns:
+            valid = work.dropna(subset=["timestamp"]).copy()
+            if not valid.empty:
+                valid["hour"] = valid["timestamp"].dt.hour
+                cat = self._normalize_existing_column(valid, "category")
+
+                work_mask = valid["hour"].between(9, 18)
+                off_mask = ~work_mask
+
+                work_total = int(work_mask.sum())
+                off_total = int(off_mask.sum())
+
+                if work_total > 0:
+                    working_hours_learning_ratio = float((work_mask & cat.eq("learning")).sum() / work_total)
+                if off_total > 0:
+                    off_hours_learning_ratio = float((off_mask & cat.eq("learning")).sum() / off_total)
+
+        return {
+            "learning_ratio": float(np.clip(learning_ratio, 0.0, 1.0)),
+            "learning_count": learning_count,
+            "total_count": total,
+            "working_hours_learning_ratio": float(np.clip(working_hours_learning_ratio, 0.0, 1.0)),
+            "off_hours_learning_ratio": float(np.clip(off_hours_learning_ratio, 0.0, 1.0)),
+        }
+
 
     # ==================== 私有方法：时间分配分析 ====================
 
@@ -978,39 +1345,33 @@ class InformationQualityEvaluator:
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError("输入数据必须是 pandas.DataFrame")
+
         if df.empty:
             raise ValueError("输入 DataFrame 为空，无法分析时间分配")
 
         working_df = df.copy()
 
-        time_col = None
-        if "timestamp" in working_df.columns:
-            time_col = "timestamp"
-            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
-        elif "visit_time" in working_df.columns:
-            time_col = "visit_time"
-            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
-        elif "ts" in working_df.columns:
-            time_col = "ts"
-            ts_num = pd.to_numeric(working_df["ts"], errors="coerce")
+        time_col = "timestamp"
 
-            inferred_unit = "ms" if float(ts_num.dropna().median()) > 1e11 else "s"
-            working_df[time_col] = pd.to_datetime(ts_num, unit=inferred_unit, errors="coerce")
-
-        if time_col is not None:
-            working_df = working_df.dropna(subset=[time_col]).sort_values(time_col)
-            working_df["hour"] = working_df[time_col].dt.hour
-            working_df["weekday"] = working_df[time_col].dt.day_name()
+        if time_col in working_df.columns:
+            working_df[time_col] = pd.to_datetime(working_df[time_col], errors="coerce")
         else:
-            working_df["hour"] = np.nan
-            working_df["weekday"] = np.nan
+            working_df = self._attach_timestamp_column(working_df)
+
+        if time_col not in working_df.columns:
+            raise ValueError("缺少可用时间列（timestamp/visit_time/ts），无法分析时间分配")
+
+        working_df = working_df.dropna(subset=[time_col]).sort_values(time_col).copy()
 
         if working_df.empty:
             raise ValueError("可用时间数据为空，无法分析时间分配")
 
+        working_df["hour"] = working_df[time_col].dt.hour
+        working_df["weekday"] = working_df[time_col].dt.day_name()
+
         # 计算类别时间占比 在没有真实 duration 时 用记录数占比近似
         if "category" in working_df.columns:
-            category_series = working_df["category"].astype(str).str.lower().str.strip()
+            category_series = self._normalize_existing_column(working_df, "category")
             category_time_ratios = category_series.value_counts(normalize=True).to_dict()
         else:
             category_series = pd.Series(["other"] * len(working_df), index=working_df.index)
@@ -1080,7 +1441,7 @@ class InformationQualityEvaluator:
         else:
             peak_hour_efficiency = 0.5
 
-        # 时长近似：history_data.csv 无 duration，用“每条记录约 3 分钟”估算
+        # 时长近似：无 duration，用“每条记录约 3 分钟”估算
         minutes_per_record = 3.0
         low_efficiency_duration = float(off_hour_count * minutes_per_record / 60.0)
         late_night_entertainment_duration = float(late_night_entertainment_count * minutes_per_record / 60.0)
@@ -1110,24 +1471,124 @@ class InformationQualityEvaluator:
     def _detect_time_waste(self, df: pd.DataFrame) -> List[RiskAlert]:
         """
         检测时间浪费模式
-
-        TODO: 识别过度娱乐时段
-        TODO: 检测碎片化浏览
-        TODO: 分析低效浏览模式
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return []
+
+        time_info = self._analyze_time_allocation(df)
+        alerts: List[RiskAlert] = []
+
+        off_ratio = float(time_info.get("off_hour_waste_ratio", 0.0))
+        frag = float(time_info.get("fragmentation_score", 0.0))
+        late_night_ent = float(time_info.get("late_night_entertainment_duration", 0.0))
+
+        if (
+            off_ratio > self._get_threshold("time_waste_off_hour_warning")
+            or frag > self._get_threshold("time_waste_fragment_warning")
+            or late_night_ent > self._get_threshold("time_waste_late_night_warning_hours")
+        ):
+            severity = self._compute_time_waste_severity(off_ratio, frag, late_night_ent)
+
+            alerts.append(
+                RiskAlert(
+                    risk_type=RiskType.TIME_WASTE,
+                    severity=severity,
+                    brief_description="时间使用效率偏低",
+                    detailed_description=(
+                        f"低效时段占比 {off_ratio:.1%}，碎片化评分 {frag:.2f}，"
+                        f"深夜娱乐时长约 {late_night_ent:.2f} 小时。"
+                    ),
+                    evidence=Evidence(key_statistics={
+                        "off_hour_waste_ratio": off_ratio,
+                        "fragmentation_score": frag,
+                        "late_night_entertainment_duration": late_night_ent,
+                    }),
+                    impact_analysis="长期低效浏览会压缩高质量输入时间并影响作息。",
+                    suggestions=[
+                        "给娱乐内容设置每日截止时间。",
+                        "把高价值阅读固定在白天高注意力时段。",
+                    ],
+                    priority=Priority.IMPORTANT if severity >= 4 else Priority.NORMAL,
+                )
+            )
+
+        return alerts
+
 
     # ==================== 私有方法：趋势分析 ====================
 
     def _analyze_temporal_trends(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         分析时间趋势
-
-        TODO: 计算各指标的时间序列变化
-        TODO: 识别改善或恶化趋势
-        TODO: 预测未来风险
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return {"series": [], "summary": {}, "predictions": []}
+
+        work = self._attach_timestamp_column(df)
+        if "timestamp" not in work.columns:
+            return {"series": [], "summary": {"message": "缺少时间列"}, "predictions": []}
+
+        work = work.dropna(subset=["timestamp"]).copy()
+        if work.empty:
+            return {"series": [], "summary": {"message": "时间数据为空"}, "predictions": []}
+
+        work["date"] = work["timestamp"].dt.date.astype(str)
+        work["category_norm"] = self._normalize_column_with_default(work, "category", "other")
+        work["polarity_num"] = pd.to_numeric(work.get("polarity", pd.Series(dtype=float)), errors="coerce")
+        work["similarity_num"] = pd.to_numeric(work.get("similarity", pd.Series(dtype=float)), errors="coerce")
+
+        records = []
+        for date_key, g in work.groupby("date"):
+            cats = g["category_norm"].value_counts(normalize=True)
+            entropy = calculate_shannon_entropy(cats.tolist()) if len(cats) > 0 else 0.0
+            max_entropy = np.log2(len(cats)) if len(cats) > 1 else 1.0
+            diversity = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+
+            negative_ratio = float((g["polarity_num"] < 0).mean()) if g["polarity_num"].notna().any() else 0.0
+            entertainment_ratio = float((g["category_norm"] == "entertainment").mean())
+            avg_similarity = float(g["similarity_num"].mean()) if g["similarity_num"].notna().any() else 0.0
+
+            records.append({
+                "date": date_key,
+                "count": int(len(g)),
+                "diversity": float(np.clip(diversity, 0.0, 1.0)),
+                "negative_ratio": float(np.clip(negative_ratio, 0.0, 1.0)),
+                "entertainment_ratio": float(np.clip(entertainment_ratio, 0.0, 1.0)),
+                "avg_similarity": float(np.clip(avg_similarity, 0.0, 1.0)),
+            })
+
+        trend_df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+        if trend_df.empty:
+            return {"series": [], "summary": {}, "predictions": []}
+
+        summary = {
+            "periods": int(len(trend_df)),
+            "avg_diversity": float(trend_df["diversity"].mean()),
+            "avg_negative_ratio": float(trend_df["negative_ratio"].mean()),
+            "avg_entertainment_ratio": float(trend_df["entertainment_ratio"].mean()),
+            "avg_similarity": float(trend_df["avg_similarity"].mean()),
+        }
+
+        predictions: List[str] = []
+        if len(trend_df) >= 3:
+            last3 = trend_df.tail(3)
+            if float(last3["negative_ratio"].mean()) > 0.4:
+                predictions.append("近期负面情绪暴露较高，建议控制负面来源。")
+            if float(last3["entertainment_ratio"].mean()) > 0.5:
+                predictions.append("近期娱乐占比较高，建议增加学习/工具类输入。")
+            if float(last3["diversity"].mean()) < 0.35:
+                predictions.append("近期信息多样性偏低，存在内容单一风险。")
+
+        return {
+            "series": trend_df.to_dict("records"),
+            "summary": summary,
+            "predictions": predictions,
+        }
+
 
     def _compare_time_periods(
         self,
@@ -1137,16 +1598,62 @@ class InformationQualityEvaluator:
     ) -> Dict[str, Any]:
         """
         对比不同时间段
-
-        TODO: 计算各指标的变化率
-        TODO: 识别显著变化
-        TODO: 生成对比报告
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            raise ValueError("df 为空，无法做时间段对比")
+
+        df1 = self._filter_by_time_range(df, period1)
+        df2 = self._filter_by_time_range(df, period2)
+
+        r1 = self.quick_evaluate(df1)
+        r2 = self.quick_evaluate(df2)
+
+        m1 = {
+            "overall_score": float(r1["overall_score"]),
+            "diversity": float(r1["dimension_scores"]["diversity"]),
+            "sentiment_health": float(r1["dimension_scores"]["sentiment_health"]),
+            "content_quality": float(r1["dimension_scores"]["content_quality"]),
+            "time_allocation": float(r1["dimension_scores"]["time_allocation"]),
+        }
+        m2 = {
+            "overall_score": float(r2["overall_score"]),
+            "diversity": float(r2["dimension_scores"]["diversity"]),
+            "sentiment_health": float(r2["dimension_scores"]["sentiment_health"]),
+            "content_quality": float(r2["dimension_scores"]["content_quality"]),
+            "time_allocation": float(r2["dimension_scores"]["time_allocation"]),
+        }
+
+        changes = {}
+        for k in m1.keys():
+            base = m1[k]
+            curr = m2[k]
+            abs_change = curr - base
+            change_rate = (abs_change / base * 100.0) if abs(base) > 1e-6 else None
+            changes[k] = {
+                "period1": base,
+                "period2": curr,
+                "abs_change": abs_change,
+                "change_rate_pct": change_rate,
+            }
+
+        significant = [
+            k for k, v in changes.items()
+            if abs(v["abs_change"]) >= (5.0 if k == "overall_score" else 3.0)
+        ]
+
+        return {
+            "period1": {"range": period1, "result": r1},
+            "period2": {"range": period2, "result": r2},
+            "changes": changes,
+            "significant_metrics": significant,
+        }
+
 
     # ==================== 私有方法：风险识别 ====================
 
-    def _identify_risks(self, df: pd.DataFrame, metrics: EvaluationMetrics) -> List[RiskAlert]:
+    def _identify_risks(self, metrics: EvaluationMetrics) -> List[RiskAlert]:
         """
         综合识别风险
 
@@ -1156,36 +1663,12 @@ class InformationQualityEvaluator:
             raise TypeError("metrics 必须是 EvaluationMetrics 实例")
 
         risks: List[RiskAlert] = []
-        thresholds = self.config.get("thresholds", {})
-
-        def build_alert(
-            risk_type: RiskType,
-            severity: int,
-            brief_description: str,
-            detailed_description: str,
-            impact_analysis: str,
-            key_statistics: Dict[str, Any],
-            suggestions: List[str],
-        ) -> RiskAlert:
-            severity = int(np.clip(severity, 1, 5))
-            priority = Priority.URGENT if severity >= 5 else Priority.IMPORTANT if severity >= 4 else Priority.NORMAL
-            return RiskAlert(
-                risk_type=risk_type,
-                severity=severity,
-                brief_description=brief_description,
-                detailed_description=detailed_description,
-                evidence=Evidence(key_statistics=key_statistics),
-                impact_analysis=impact_analysis,
-                potential_consequences=[],
-                suggestions=suggestions,
-                priority=priority,
-            )
 
         # 信息茧房：类别过于集中 + 内容相似度过高
         dom_ratio = float(metrics.diversity.dominant_category_ratio)
         avg_similarity = float(metrics.diversity.avg_similarity)
-        dom_limit = float(thresholds.get("dominant_category_ratio", self.DOMINANT_CATEGORY_RATIO_LIMIT))
-        sim_limit = float(thresholds.get("echo_chamber_similarity", self.ECHO_CHAMBER_SIMILARITY_LIMIT))
+        dom_limit = self._get_threshold("dominant_category_ratio")
+        sim_limit = self._get_threshold("echo_chamber_similarity")
 
         if dom_ratio > dom_limit or avg_similarity > sim_limit:
             exceed_ratio = max(
@@ -1194,7 +1677,7 @@ class InformationQualityEvaluator:
             )
             severity = 3 + int(np.clip(np.ceil(exceed_ratio * 2), 0, 2))
             risks.append(
-                build_alert(
+                self._build_alert(
                     risk_type=RiskType.ECHO_CHAMBER,
                     severity=severity,
                     brief_description="内容同质化明显，存在信息茧房倾向",
@@ -1217,12 +1700,12 @@ class InformationQualityEvaluator:
 
         # 情绪污染：负面占比高
         negative_ratio = float(metrics.sentiment_health.negative_ratio)
-        negative_limit = float(thresholds.get("negative_ratio_warning", self.NEGATIVE_RATIO_WARNING))
+        negative_limit = self._get_threshold("negative_ratio_warning")
         if negative_ratio > negative_limit:
             exceed = (negative_ratio - negative_limit) / max(1e-6, 1 - negative_limit)
             severity = 3 + int(np.clip(np.ceil(exceed * 2), 0, 2))
             risks.append(
-                build_alert(
+                self._build_alert(
                     risk_type=RiskType.EMOTION_POLLUTION,
                     severity=severity,
                     brief_description="负面内容占比较高，情绪健康受损",
@@ -1243,12 +1726,12 @@ class InformationQualityEvaluator:
 
         # 过度娱乐：娱乐内容占比高
         entertainment_ratio = float(metrics.content_quality.entertainment_ratio)
-        entertainment_limit = float(thresholds.get("entertainment_ratio_warning", self.ENTERTAINMENT_RATIO_WARNING))
+        entertainment_limit = self._get_threshold("entertainment_ratio_warning")
         if entertainment_ratio > entertainment_limit:
             exceed = (entertainment_ratio - entertainment_limit) / max(1e-6, 1 - entertainment_limit)
             severity = 3 + int(np.clip(np.ceil(exceed * 2), 0, 2))
             risks.append(
-                build_alert(
+                self._build_alert(
                     risk_type=RiskType.EXCESSIVE_ENTERTAINMENT,
                     severity=severity,
                     brief_description="娱乐内容消费偏高，影响信息质量",
@@ -1271,15 +1754,19 @@ class InformationQualityEvaluator:
         off_hour_waste_ratio = float(metrics.time_allocation.off_hour_waste_ratio)
         fragmentation_score = float(metrics.time_allocation.fragmentation_score)
         late_night_ent_duration = float(metrics.time_allocation.late_night_entertainment_duration)
-        if off_hour_waste_ratio > 0.35 or fragmentation_score > 0.70 or late_night_ent_duration > 1.0:
-            severity = 3
-            if off_hour_waste_ratio > 0.50 or fragmentation_score > 0.85 or late_night_ent_duration > 2.0:
-                severity = 4
-            if off_hour_waste_ratio > 0.65 or late_night_ent_duration > 3.0:
-                severity = 5
+        if (
+            off_hour_waste_ratio > self._get_threshold("time_waste_off_hour_warning")
+            or fragmentation_score > self._get_threshold("time_waste_fragment_warning")
+            or late_night_ent_duration > self._get_threshold("time_waste_late_night_warning_hours")
+        ):
+            severity = self._compute_time_waste_severity(
+                off_hour_waste_ratio,
+                fragmentation_score,
+                late_night_ent_duration,
+            )
 
             risks.append(
-                build_alert(
+                self._build_alert(
                     risk_type=RiskType.TIME_WASTE,
                     severity=severity,
                     brief_description="时间利用效率偏低，存在明显浪费",
@@ -1306,7 +1793,7 @@ class InformationQualityEvaluator:
         if category_diversity_score < 0.35:
             severity = 4 if category_diversity_score < 0.20 else 3
             risks.append(
-                build_alert(
+                self._build_alert(
                     risk_type=RiskType.CONTENT_MONOTONY,
                     severity=severity,
                     brief_description="内容类别结构单一，输入广度不足",
@@ -1333,12 +1820,65 @@ class InformationQualityEvaluator:
     ) -> RiskAlert:
         """
         生成单个风险警报
-
-        TODO: 根据风险类型生成描述
-        TODO: 提取关键证据
-        TODO: 生成针对性建议
         """
-        pass
+        severity = int(np.clip(severity, 1, 5))
+
+        templates = {
+            RiskType.ECHO_CHAMBER: {
+                "brief": "存在信息茧房倾向",
+                "detail": "内容来源或主题过于集中，且相似内容占比较高。",
+                "impact": "可能导致视角收窄与判断偏差。",
+                "suggestions": ["扩展不同领域信息源", "主动阅读与既有偏好相反的观点"],
+            },
+            RiskType.TOXIC_CONTENT: {
+                "brief": "存在信息毒品风险",
+                "detail": "负面或高刺激内容暴露较多。",
+                "impact": "可能增加情绪负担并影响注意力。",
+                "suggestions": ["减少高刺激内容连续浏览", "提高高质量内容占比"],
+            },
+            RiskType.TIME_WASTE: {
+                "brief": "存在时间浪费风险",
+                "detail": "低效时段使用偏高或碎片化明显。",
+                "impact": "会挤压高质量输入与休息时间。",
+                "suggestions": ["固定专注时段", "设置晚间浏览截止时间"],
+            },
+            RiskType.EMOTION_POLLUTION: {
+                "brief": "存在情绪污染风险",
+                "detail": "负面内容比例偏高。",
+                "impact": "可能导致焦虑、疲惫等负面体验。",
+                "suggestions": ["降低负面来源订阅频率", "增加中性/积极内容"],
+            },
+            RiskType.CONTENT_MONOTONY: {
+                "brief": "内容结构单一",
+                "detail": "类别多样性不足。",
+                "impact": "信息面窄，不利于综合判断。",
+                "suggestions": ["制定跨类别摄入计划", "减少单一类别连续阅读"],
+            },
+            RiskType.EXCESSIVE_ENTERTAINMENT: {
+                "brief": "娱乐消费过高",
+                "detail": "娱乐内容占比超过建议范围。",
+                "impact": "可能影响学习与深度思考投入。",
+                "suggestions": ["设定娱乐时长上限", "将学习内容前置"],
+            },
+        }
+
+        tpl = templates.get(risk_type, {
+            "brief": "发现潜在风险",
+            "detail": "检测到异常模式。",
+            "impact": "建议及时调整信息摄取策略。",
+            "suggestions": ["关注近期行为变化", "适度调整内容结构"],
+        })
+
+        return self._build_alert(
+            risk_type=risk_type,
+            severity=severity,
+            brief_description=tpl["brief"],
+            detailed_description=tpl["detail"],
+            impact_analysis=tpl["impact"],
+            key_statistics=evidence or {},
+            suggestions=list(tpl["suggestions"]),
+        )
+
 
     # ==================== 私有方法：建议生成 ====================
 
@@ -1349,33 +1889,318 @@ class InformationQualityEvaluator:
     ) -> List[str]:
         """
         生成改进建议
-
-        TODO: 基于风险类型生成建议
-        TODO: 根据严重程度排序
-        TODO: 提供可操作的具体措施
         """
-        pass
+        merged: List[str] = []
+        seen = set()
+
+        def add_suggestion(text: str) -> None:
+            t = str(text).strip()
+            if t and t not in seen:
+                seen.add(t)
+                merged.append(t)
+
+        sorted_risk = sorted(risks, key=lambda r: r.severity, reverse=True)
+        for risk in sorted_risk:
+            for s in risk.suggestions:
+                add_suggestion(s)
+
+        if not merged:
+            if metrics.diversity.category_diversity_score < 0.5:
+                add_suggestion("增加跨类别信息摄入（学习/新闻/工具），降低单一内容连续浏览。")
+            if metrics.sentiment_health.negative_ratio > 0.35:
+                add_suggestion("减少高负面信息源暴露，增加中性与积极内容比例。")
+            if metrics.content_quality.entertainment_ratio > 0.45:
+                add_suggestion("设置娱乐内容时长上限，将高价值内容前置到白天。")
+            if metrics.time_allocation.off_hour_waste_ratio > 0.35:
+                add_suggestion("减少深夜浏览，固定高效阅读时段并控制碎片化使用。")
+
+        if not merged:
+            add_suggestion("当前信息摄取结构总体稳定，建议每周复盘一次并保持多样化输入。")
+
+        return merged
 
     def _generate_category_suggestions(self, df: pd.DataFrame) -> List[str]:
         """
         生成类别平衡建议
-
-        TODO: 识别缺失或不足的类别
-        TODO: 建议增加的内容类型
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty or "category" not in df.columns:
+            return []
+
+        category = self._normalize_existing_column(df, "category")
+        ratio = category.value_counts(normalize=True)
+
+        suggestions: List[str] = []
+        if float(ratio.get("learning", 0.0)) < 0.20:
+            suggestions.append("学习类内容占比较低，建议提升至 20% 以上。")
+        if float(ratio.get("news", 0.0)) < 0.10:
+            suggestions.append("新闻类输入偏少，建议增加权威资讯来源。")
+        if float(ratio.get("tools", 0.0)) < 0.10:
+            suggestions.append("工具类内容较少，可增加效率工具与方法论内容。")
+        if float(ratio.get("entertainment", 0.0)) > 0.45:
+            suggestions.append("娱乐类内容偏高，建议设置每日上限并分配到低优先级时段。")
+
+        if not suggestions:
+            suggestions.append("当前类别结构相对均衡，保持跨类别输入即可。")
+
+        return suggestions
+
 
     def _generate_time_management_suggestions(self, df: pd.DataFrame) -> List[str]:
         """
         生成时间管理建议
-
-        TODO: 基于时间分配分析
-        TODO: 建议调整浏览时段
-        TODO: 推荐时间管理策略
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return []
+
+        try:
+            time_info = self._analyze_time_allocation(df)
+        except Exception:
+            return ["缺少可用时间数据，建议补充 timestamp/visit_time/ts 后再分析。"]
+
+        suggestions: List[str] = []
+
+        off_ratio = float(time_info.get("off_hour_waste_ratio", 0.0))
+        frag = float(time_info.get("fragmentation_score", 0.0))
+        late_night_ent = float(time_info.get("late_night_entertainment_duration", 0.0))
+        peak_eff = float(time_info.get("peak_hour_efficiency", 0.0))
+
+        if off_ratio > self._get_threshold("time_waste_off_hour_warning"):
+            suggestions.append("深夜时段使用偏高，建议 23:00 后减少非必要浏览。")
+        if frag > self._get_threshold("time_waste_fragment_warning"):
+            suggestions.append("碎片化浏览明显，建议采用番茄钟或固定阅读块（20-30 分钟）。")
+        if late_night_ent > self._get_threshold("time_waste_late_night_warning_hours"):
+            suggestions.append("深夜娱乐时长偏高，建议设置娱乐内容截止时间。")
+        if peak_eff < 0.4:
+            suggestions.append("白天高效时段利用不足，建议把学习/工具内容前置到 9:00-18:00。")
+
+        if not suggestions:
+            suggestions.append("当前时间分配较合理，建议继续保持固定高价值输入时段。")
+
+        return suggestions
+
 
     # ==================== 核心公共方法 ====================
+
+    def _determine_health_level(self, overall_score: float) -> HealthLevel:
+        """根据综合分数映射健康等级。"""
+        if overall_score >= 90:
+            return HealthLevel.EXCELLENT
+        if overall_score >= 75:
+            return HealthLevel.GOOD
+        if overall_score >= 60:
+            return HealthLevel.FAIR
+        if overall_score >= 40:
+            return HealthLevel.WARNING
+        return HealthLevel.CRITICAL
+
+    def _build_metrics(
+        self,
+        processed_df: pd.DataFrame,
+        category_diversity_score: float,
+        content_diversity_score: float,
+        content_quality_score: float,
+        sentiment_health_score: float,
+        time_alloc: Dict[str, Any],
+    ) -> EvaluationMetrics:
+        """将各维度计算结果组装为 EvaluationMetrics。"""
+        category_counts = self._normalize_existing_column(processed_df, "category").value_counts()
+        sentiment_counts = self._normalize_existing_column(processed_df, "sentiment").value_counts()
+        polarity_series = pd.to_numeric(processed_df["polarity"], errors="coerce").dropna()
+
+        # 1) DiversityMetrics
+        content_div_details = self._cache.get("content_diversity_details", {})
+        category_distribution = {str(k): int(v) for k, v in category_counts.to_dict().items()}
+        category_ratios = (category_counts / category_counts.sum()).tolist() if len(category_counts) > 0 else []
+        category_entropy = calculate_shannon_entropy(category_ratios)
+
+        if len(category_counts) > 0:
+            dominant_category = str(category_counts.index[0])
+            dominant_category_ratio = float(category_counts.iloc[0] / category_counts.sum())
+        else:
+            dominant_category = "other"
+            dominant_category_ratio = 0.0
+
+        diversity_metrics = DiversityMetrics(
+            category_diversity_score=float(category_diversity_score),
+            category_count=int(len(category_counts)),
+            category_entropy=float(category_entropy),
+            dominant_category=dominant_category,
+            dominant_category_ratio=float(dominant_category_ratio),
+            content_diversity_score=float(content_diversity_score),
+            avg_similarity=float(content_div_details.get("avg_similarity", 0.0)),
+            duplicate_ratio=float(content_div_details.get("duplicate_ratio", 0.0)),
+            cluster_count=int(content_div_details.get("cluster_count", 0)),
+            category_distribution=category_distribution,
+            similarity_distribution=list(content_div_details.get("similarity_distribution", [])),
+        )
+
+        # 2) SentimentHealthMetrics
+        total_sent = max(len(processed_df), 1)
+        positive_ratio = float(sentiment_counts.get("positive", 0) / total_sent)
+        negative_ratio = float(sentiment_counts.get("negative", 0) / total_sent)
+        neutral_ratio = float(sentiment_counts.get("neutral", 0) / total_sent)
+
+        polarity_mean = float(polarity_series.mean()) if not polarity_series.empty else 0.0
+        polarity_std = float(polarity_series.std()) if len(polarity_series) >= 2 else 0.0
+        extreme_emotion_count = int((polarity_series.abs() >= 0.8).sum()) if not polarity_series.empty else 0
+
+        sentiment_metrics = SentimentHealthMetrics(
+            sentiment_health_score=float(sentiment_health_score),
+            positive_ratio=positive_ratio,
+            negative_ratio=negative_ratio,
+            neutral_ratio=neutral_ratio,
+            polarity_mean=polarity_mean,
+            polarity_std=polarity_std,
+            extreme_emotion_count=extreme_emotion_count,
+            sentiment_distribution={str(k): int(v) for k, v in sentiment_counts.to_dict().items()},
+            polarity_values=polarity_series.tolist(),
+        )
+
+        # 3) ContentQualityMetrics
+        category_ratio_map = (category_counts / category_counts.sum()).to_dict() if len(category_counts) > 0 else {}
+        content_metrics = ContentQualityMetrics(
+            content_quality_score=float(content_quality_score),
+            weighted_quality_score=float(content_quality_score),
+            learning_ratio=float(category_ratio_map.get("learning", 0.0)),
+            news_ratio=float(category_ratio_map.get("news", 0.0)),
+            tools_ratio=float(category_ratio_map.get("tools", 0.0)),
+            entertainment_ratio=float(category_ratio_map.get("entertainment", 0.0)),
+            social_ratio=float(category_ratio_map.get("social", 0.0)),
+            shopping_ratio=float(category_ratio_map.get("shopping", 0.0)),
+            other_ratio=float(category_ratio_map.get("other", 0.0)),
+            category_time_distribution={str(k): float(v) for k, v in category_ratio_map.items()},
+            category_weights={},
+        )
+
+        # 4) TimeAllocationMetrics
+        time_metrics = TimeAllocationMetrics(
+            time_allocation_score=float(time_alloc.get("time_allocation_score", 0.0)),
+            peak_hour_efficiency=float(time_alloc.get("peak_hour_efficiency", 0.0)),
+            off_hour_waste_ratio=float(time_alloc.get("off_hour_waste_ratio", 0.0)),
+            fragmentation_score=float(time_alloc.get("fragmentation_score", 0.0)),
+            avg_session_duration=float(time_alloc.get("avg_session_duration", 0.0)),
+            low_efficiency_duration=float(time_alloc.get("low_efficiency_duration", 0.0)),
+            late_night_entertainment_duration=float(time_alloc.get("late_night_entertainment_duration", 0.0)),
+            category_time_ratios=dict(time_alloc.get("category_time_ratios", {})),
+            hourly_distribution=dict(time_alloc.get("hourly_distribution", {})),
+            weekday_distribution=dict(time_alloc.get("weekday_distribution", {})),
+        )
+
+        dimension_scores = {
+            "diversity": float(diversity_metrics.category_diversity_score),
+            "sentiment_health": float(sentiment_metrics.sentiment_health_score),
+            "content_quality": float(content_metrics.content_quality_score),
+            "time_allocation": float(time_metrics.time_allocation_score),
+        }
+        overall_score = float(weighted_average(dimension_scores, self.config.weights) * 100)
+
+        return EvaluationMetrics(
+            diversity=diversity_metrics,
+            sentiment_health=sentiment_metrics,
+            content_quality=content_metrics,
+            time_allocation=time_metrics,
+            overall_score=overall_score,
+            dimension_weights=self.config.weights.copy(),
+        )
+
+    def _build_recommendations(
+        self,
+        processed_df: pd.DataFrame,
+        metrics: EvaluationMetrics,
+        risk_alerts: List[RiskAlert],
+    ) -> Recommendations:
+        """将建议文本按风险优先级归类为结构化 Recommendations。"""
+        suggestion_texts = self._generate_suggestions(metrics, risk_alerts)
+        category_suggestions = self._generate_category_suggestions(processed_df)
+        time_suggestions = self._generate_time_management_suggestions(processed_df)
+
+        recommendations = Recommendations()
+
+        for text in suggestion_texts:
+            rec = ActionableRecommendation(
+                action=text,
+                reason="基于风险识别自动生成",
+                difficulty=Difficulty.EASY,
+                expected_improvement=0.10,
+            )
+
+            matched_priority = None
+            for risk in sorted(risk_alerts, key=lambda r: r.severity, reverse=True):
+                if text in risk.suggestions:
+                    matched_priority = risk.priority
+                    break
+
+            if matched_priority == Priority.URGENT:
+                recommendations.urgent_recommendations.append(rec)
+            elif matched_priority == Priority.IMPORTANT:
+                recommendations.important_recommendations.append(rec)
+            else:
+                recommendations.normal_recommendations.append(rec)
+
+        recommendations.category_balance.specific_content_suggestions = category_suggestions
+        recommendations.time_management.time_slot_adjustments = time_suggestions
+
+        return recommendations
+
+    def _build_report_metadata(self, raw_df: pd.DataFrame, processed_df: pd.DataFrame) -> ReportMetadata:
+        """构建报告元信息，统一处理时间范围与兜底逻辑。"""
+        if "timestamp" in processed_df.columns and not processed_df["timestamp"].empty:
+            start_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").min()
+            end_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").max()
+        else:
+            start_date = datetime.now()
+            end_date = datetime.now()
+
+        if pd.isna(start_date):
+            start_date = datetime.now()
+        if pd.isna(end_date):
+            end_date = datetime.now()
+
+        time_span_days = max((end_date.date() - start_date.date()).days + 1, 1)
+
+        return ReportMetadata(
+            start_date=start_date,
+            end_date=end_date,
+            total_records=int(len(raw_df)),
+            valid_records=int(len(processed_df)),
+            time_span_days=int(time_span_days),
+            generated_at=datetime.now(),
+            evaluator_version="0.1.0",
+            config_info=self.config.to_dict(),
+        )
+
+    def _compute_quick_dimension_scores(self, processed_df: pd.DataFrame) -> Dict[str, float]:
+        """计算快速评估四维分数（0-1）。"""
+        category_norm = self._normalize_existing_column(processed_df, "category")
+        sentiment_norm = self._normalize_existing_column(processed_df, "sentiment")
+        similarity_num = pd.to_numeric(processed_df["similarity"], errors="coerce").dropna().clip(0.0, 1.0)
+
+        category_counts = category_norm.value_counts()
+        category_probs = (category_counts / category_counts.sum()).tolist()
+        entropy = calculate_shannon_entropy(category_probs)
+        max_entropy = np.log2(len(category_probs)) if len(category_probs) > 1 else 1.0
+        diversity_score = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+        diversity_score = float(np.clip(diversity_score, 0.0, 1.0))
+
+        negative_ratio = float((sentiment_norm == "negative").mean())
+        sentiment_health_score = float(np.clip(1.0 - negative_ratio, 0.0, 1.0))
+
+        entertainment_ratio = float((category_norm == "entertainment").mean())
+        content_quality_score = float(np.clip(1.0 - entertainment_ratio, 0.0, 1.0))
+
+        avg_similarity = float(similarity_num.mean()) if not similarity_num.empty else 0.0
+        time_allocation_score = float(np.clip(1.0 - avg_similarity, 0.0, 1.0))
+
+        return {
+            "diversity": diversity_score,
+            "sentiment_health": sentiment_health_score,
+            "content_quality": content_quality_score,
+            "time_allocation": time_allocation_score,
+        }
 
     def evaluate(
         self,
@@ -1399,6 +2224,7 @@ class InformationQualityEvaluator:
             raise TypeError("数据无效，无法评估")
 
         processed_df = self._preprocess_data(df)
+        processed_df = self._filter_by_time_range(processed_df, time_range=time_range)
 
         category_diversity_score = self._calculate_category_diversity(df=processed_df)
         content_diversity_score = self._calculate_content_diversity(df=processed_df)
@@ -1406,178 +2232,41 @@ class InformationQualityEvaluator:
         sentiment_health_score = self._calculate_sentiment_health(df=processed_df)
         time_alloc = self._analyze_time_allocation(df=processed_df)
 
-        category_counts = processed_df["category"].astype(str).str.lower().value_counts()
-        sentiment_counts = processed_df['sentiment'].astype(str).str.lower().value_counts()
-        polarity_series = pd.to_numeric(processed_df['polarity'], errors='coerce').dropna()
-
-
-        # 构造 DiversityMetrics
-        content_div_details = self._cache.get('content_diversity_details', {})
-
-        category_distribution = {str(k): int(v) for k, v in category_counts.to_dict().items()}
-        category_ratios = (category_counts / category_counts.sum()).tolist() if len(category_counts) > 0 else []
-        category_entropy = calculate_shannon_entropy(category_ratios)
-
-        if len(category_counts) > 0:
-            dominant_category = str(category_counts.index[0])
-            dominant_category_ratio = float(category_counts.iloc[0] / category_counts.sum())
-        else:
-            dominant_category = "other"
-            dominant_category_ratio = 0.0
-
-        diversity_metrics = DiversityMetrics(
-            category_diversity_score=float(category_diversity_score),
-            category_count=int(len(category_counts)),
-            category_entropy=float(category_entropy),
-            dominant_category=dominant_category,
-            dominant_category_ratio=float(dominant_category_ratio),
-
-            content_diversity_score=float(content_diversity_score),
-            avg_similarity=float(content_div_details.get("avg_similarity", 0.0)),
-            duplicate_ratio=float(content_div_details.get("duplicate_ratio", 0.0)),
-            cluster_count=int(content_div_details.get("cluster_count", 0)),
-
-            category_distribution=category_distribution,
-            similarity_distribution=list(content_div_details.get("similarity_distribution", [])),
+        metrics = self._build_metrics(
+            processed_df=processed_df,
+            category_diversity_score=category_diversity_score,
+            content_diversity_score=content_diversity_score,
+            content_quality_score=content_quality_score,
+            sentiment_health_score=sentiment_health_score,
+            time_alloc=time_alloc,
         )
 
-        # 构造 SentimentHealthMetrics
-        total_sent = max(len(processed_df), 1)
-        positive_ratio = float(sentiment_counts.get("positive", 0) / total_sent)
-        negative_ratio = float(sentiment_counts.get("negative", 0) / total_sent)
-        neutral_ratio = float(sentiment_counts.get("neutral", 0) / total_sent)
-
-        polarity_mean = float(polarity_series.mean()) if not polarity_series.empty else 0.0
-        polarity_std = float(polarity_series.std()) if len(polarity_series) >= 2 else 0.0
-        extreme_emotion_count = int((polarity_series.abs() >= 0.8).sum()) if not polarity_series.empty else 0
-
-        sentiment_metrics = SentimentHealthMetrics(
-            sentiment_health_score=float(sentiment_health_score),
-
-            positive_ratio=positive_ratio,
-            negative_ratio=negative_ratio,
-            neutral_ratio=neutral_ratio,
-
-            polarity_mean=polarity_mean,
-            polarity_std=polarity_std,
-            extreme_emotion_count=extreme_emotion_count,
-
-            sentiment_distribution={str(k): int(v) for k, v in sentiment_counts.to_dict().items()},
-            polarity_values=polarity_series.tolist(),
-        )
-
-        # 构造 ContentQualityMetrics
-        category_ratio_map = (category_counts / category_counts.sum()).to_dict() if len(category_counts) > 0 else {}
-
-        content_metrics = ContentQualityMetrics(
-            content_quality_score=float(content_quality_score),
-            weighted_quality_score=float(content_quality_score),
-
-            learning_ratio=float(category_ratio_map.get("learning", 0.0)),
-            news_ratio=float(category_ratio_map.get("news", 0.0)),
-            tools_ratio=float(category_ratio_map.get("tools", 0.0)),
-            entertainment_ratio=float(category_ratio_map.get("entertainment", 0.0)),
-            social_ratio=float(category_ratio_map.get("social", 0.0)),
-            shopping_ratio=float(category_ratio_map.get("shopping", 0.0)),
-            other_ratio=float(category_ratio_map.get("other", 0.0)),
-
-            category_time_distribution={str(k): float(v) for k, v in category_ratio_map.items()},
-            category_weights={},
-        )
-
-        # 构造 TimeAllocationMetrics
-        time_metrics = TimeAllocationMetrics(
-            time_allocation_score=float(time_alloc.get("time_allocation_score", 0.0)),
-            peak_hour_efficiency=float(time_alloc.get("peak_hour_efficiency", 0.0)),
-            off_hour_waste_ratio=float(time_alloc.get("off_hour_waste_ratio", 0.0)),
-            fragmentation_score=float(time_alloc.get("fragmentation_score", 0.0)),
-            avg_session_duration=float(time_alloc.get("avg_session_duration", 0.0)),
-            low_efficiency_duration=float(time_alloc.get("low_efficiency_duration", 0.0)),
-            late_night_entertainment_duration=float(time_alloc.get("late_night_entertainment_duration", 0.0)),
-            category_time_ratios=dict(time_alloc.get("category_time_ratios", {})),
-            hourly_distribution=dict(time_alloc.get("hourly_distribution", {})),
-            weekday_distribution=dict(time_alloc.get("weekday_distribution", {})),
-        )
-
-        # 拼接为 EvaluationMetrics
-        dimension_scores = {
-            "diversity": float(diversity_metrics.category_diversity_score),
-            "sentiment_health": float(sentiment_metrics.sentiment_health_score),
-            "content_quality": float(content_metrics.content_quality_score),
-            "time_allocation": float(time_metrics.time_allocation_score),
-        }
-        overall_score = float(weighted_average(dimension_scores, self.config["weights"]) * 100)
-
-        metrics = EvaluationMetrics(
-            diversity=diversity_metrics,
-            sentiment_health=sentiment_metrics,
-            content_quality=content_metrics,
-            time_allocation=time_metrics,
-            overall_score=overall_score,
-            dimension_weights=self.config["weights"].copy(),
-        )
-
-        # 构造 ReportMetadata
-        if overall_score >= 90:
-            level = HealthLevel.EXCELLENT
-        elif overall_score >= 75:
-            level = HealthLevel.GOOD
-        elif overall_score >= 60:
-            level = HealthLevel.FAIR
-        elif overall_score >= 40:
-            level = HealthLevel.WARNING
-        else:
-            level = HealthLevel.CRITICAL
-
+        overall_score = float(metrics.overall_score)
+        level = self._determine_health_level(overall_score)
         health_status = HealthStatus(
             level=level,
             score=round(overall_score, 2),
             justification=(
                 f"综合评分 {overall_score:.1f}，"
-                f"多样性 {diversity_metrics.category_diversity_score * 100:.1f}，"
-                f"情感健康 {sentiment_metrics.sentiment_health_score * 100:.1f}，"
-                f"内容质量 {content_metrics.content_quality_score * 100:.1f}，"
-                f"时间分配 {time_metrics.time_allocation_score * 100:.1f}"
+                f"多样性 {metrics.diversity.category_diversity_score * 100:.1f}，"
+                f"情感健康 {metrics.sentiment_health.sentiment_health_score * 100:.1f}，"
+                f"内容质量 {metrics.content_quality.content_quality_score * 100:.1f}，"
+                f"时间分配 {metrics.time_allocation.time_allocation_score * 100:.1f}"
             )
         )
 
-        risk_alerts = self._identify_risks(processed_df, metrics)
+        risk_alerts = self._identify_risks(metrics)
+        recommendations = self._build_recommendations(processed_df, metrics, risk_alerts)
+        metadata = self._build_report_metadata(df, processed_df)
 
-        if "timestamp" in processed_df.columns and not processed_df["timestamp"].empty:
-            start_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").min()
-            end_date = pd.to_datetime(processed_df["timestamp"], errors="coerce").max()
-        else:
-            # 没有时间列时，用当前时间兜底
-            start_date = datetime.now()
-            end_date = datetime.now()
-
-        if pd.isna(start_date):
-            start_date = datetime.now()
-        if pd.isna(end_date):
-            end_date = datetime.now()
-
-        time_span_days = max((end_date.date() - start_date.date()).days + 1, 1)
-
-        metadata = ReportMetadata(
-            start_date=start_date,
-            end_date=end_date,
-            total_records=int(len(df)),
-            valid_records=int(len(processed_df)),
-            time_span_days=int(time_span_days),
-            generated_at=datetime.now(),
-            evaluator_version="0.1.0",
-            config_info=self.config.copy()
-        )
-
-        # 组装 EvaluationReport
         report = EvaluationReport(
             metadata=metadata,
             health_status=health_status,
             metrics=metrics,
             risk_alerts=risk_alerts,
             detailed_analysis=None if not detailed else None,  # 先占位，后续再填详细分析
-            recommendations=Recommendations(),  # 先空，后续接 _generate_suggestions
-            trend_analysis=None
+            recommendations=recommendations,
+            trend_analysis=None,
         )
 
         self.last_report = report
@@ -1590,50 +2279,20 @@ class InformationQualityEvaluator:
         self._validate_dataframe(df)
         processed_df = self._preprocess_data(df)
 
-        category_counts = processed_df["category"].value_counts()
-        category_probs = (category_counts / category_counts.sum()).tolist()
-        entropy = calculate_shannon_entropy(category_probs)
-        max_entropy = np.log2(len(category_probs)) if len(category_probs) > 1 else 1.0
-        diversity_score = float(entropy / max_entropy) if max_entropy > 0 else 0.0
-        diversity_score = float(np.clip(diversity_score, 0.0, 1.0))
-
-        negative_ratio = float((processed_df["sentiment"] == "negative").mean())
-        sentiment_health_score = float(np.clip(1.0 - negative_ratio, 0.0, 1.0))
-
-        entertainment_ratio = float((processed_df["category"] == "entertainment").mean())
-        content_quality_score = float(np.clip(1.0 - entertainment_ratio, 0.0, 1.0))
-
-        avg_similarity = float(processed_df["similarity"].mean())
-        time_allocation_score = float(np.clip(1.0 - avg_similarity, 0.0, 1.0))
-
-        dimension_scores = {
-            "diversity": diversity_score,
-            "sentiment_health": sentiment_health_score,
-            "content_quality": content_quality_score,
-            "time_allocation": time_allocation_score,
-        }
-        overall_0_1 = weighted_average(dimension_scores, self.config["weights"])
+        dimension_scores = self._compute_quick_dimension_scores(processed_df)
+        overall_0_1 = weighted_average(dimension_scores, self.config.weights)
         overall_score = round(overall_0_1 * 100, 2)
 
-        if overall_score >= 90:
-            level = HealthLevel.EXCELLENT.value
-        elif overall_score >= 75:
-            level = HealthLevel.GOOD.value
-        elif overall_score >= 60:
-            level = HealthLevel.FAIR.value
-        elif overall_score >= 40:
-            level = HealthLevel.WARNING.value
-        else:
-            level = HealthLevel.CRITICAL.value
+        level = self._determine_health_level(overall_score).value
 
         return {
             "overall_score": overall_score,
             "health_level": level,
             "dimension_scores": {
-                "diversity": round(diversity_score * 100, 2),
-                "sentiment_health": round(sentiment_health_score * 100, 2),
-                "content_quality": round(content_quality_score * 100, 2),
-                "time_allocation": round(time_allocation_score * 100, 2),
+                "diversity": round(dimension_scores["diversity"] * 100, 2),
+                "sentiment_health": round(dimension_scores["sentiment_health"] * 100, 2),
+                "content_quality": round(dimension_scores["content_quality"] * 100, 2),
+                "time_allocation": round(dimension_scores["time_allocation"] * 100, 2),
             },
             "sample_info": {
                 "total_records": int(len(df)),
@@ -1650,12 +2309,49 @@ class InformationQualityEvaluator:
     ) -> pd.DataFrame:
         """
         批量评估（按时间段分组）
-
-        TODO: 按指定维度分组
-        TODO: 对每组执行评估
-        TODO: 返回评估结果 DataFrame
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            raise ValueError("df 为空，无法批量评估")
+
+        working_df = df.copy()
+
+        if group_by == "date":
+            if "date" not in working_df.columns:
+                working_df = self._attach_timestamp_column(working_df)
+                if "timestamp" not in working_df.columns:
+                    raise ValueError("按 date 分组需要 date 或可解析时间列（timestamp/visit_time/ts）")
+                working_df = working_df.dropna(subset=["timestamp"]).copy()
+                working_df["date"] = working_df["timestamp"].dt.date.astype(str)
+            else:
+                working_df["date"] = working_df["date"].astype(str)
+            key_col = "date"
+        else:
+            if group_by not in working_df.columns:
+                raise ValueError(f"group_by 列不存在: {group_by}")
+            key_col = group_by
+
+        rows: List[Dict[str, Any]] = []
+        min_records = int(self.config.min_records)
+
+        for key, group_df in working_df.groupby(key_col):
+            if len(group_df) < min_records:
+                logger.warning(f"分组 {key} 样本不足（{len(group_df)} < {min_records}），跳过")
+                continue
+
+            try:
+                result = self.quick_evaluate(group_df)
+                rows.append(self._build_score_row(result, id_key="period", id_value=key))
+            except Exception as e:
+                logger.exception(f"分组 {key} 评估失败: {e}")
+
+        trend_df = pd.DataFrame(rows)
+        if trend_df.empty:
+            return trend_df
+
+        trend_df = trend_df.sort_values(by="period").reset_index(drop=True)
+        return trend_df
 
     def compare_users(
         self,
@@ -1663,24 +2359,105 @@ class InformationQualityEvaluator:
     ) -> Dict[str, Any]:
         """
         对比多个用户的信息摄取质量
-
-        TODO: 对每个用户执行评估
-        TODO: 计算相对排名
-        TODO: 生成对比报告
         """
-        pass
+        if not isinstance(user_data, dict) or not user_data:
+            raise ValueError("user_data 必须是非空 dict，格式 {user_id: DataFrame}")
+
+        rankings: List[Dict[str, Any]] = []
+        failed_users: List[Dict[str, str]] = []
+
+        for user_id, user_df in user_data.items():
+            try:
+                result = self.quick_evaluate(user_df)
+                rankings.append(self._build_score_row(result, id_key="user_id", id_value=user_id))
+            except Exception as e:
+                failed_users.append({"user_id": str(user_id), "error": str(e)})
+                logger.exception(f"用户 {user_id} 评估失败: {e}")
+
+        rankings = sorted(rankings, key=lambda x: x["overall_score"], reverse=True)
+        for idx, row in enumerate(rankings, start=1):
+            row["rank"] = idx
+
+        scores = [r["overall_score"] for r in rankings]
+        summary = {
+            "total_users": int(len(user_data)),
+            "evaluated_users": int(len(rankings)),
+            "failed_users": int(len(failed_users)),
+            "average_score": float(np.mean(scores)) if scores else None,
+            "best_user": rankings[0]["user_id"] if rankings else None,
+            "worst_user": rankings[-1]["user_id"] if rankings else None,
+        }
+
+        return {
+            "rankings": rankings,
+            "summary": summary,
+            "failed_users": failed_users,
+        }
+
 
     # ==================== 可视化支持 ====================
 
     def get_visualization_data(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
         准备可视化数据
-
-        TODO: 提取关键指标的时间序列
-        TODO: 准备分布图数据
-        TODO: 生成热力图数据
         """
-        pass
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df 必须是 pandas.DataFrame")
+        if df.empty:
+            return {
+                "time_series": [],
+                "category_distribution": {},
+                "sentiment_distribution": {},
+                "similarity_histogram": {},
+                "hourly_distribution": {},
+            }
+
+        work = self._preprocess_data(df)
+
+        category_distribution = (
+            self._normalize_existing_column(work, "category").value_counts(normalize=True).to_dict()
+            if "category" in work.columns else {}
+        )
+        sentiment_distribution = (
+            self._normalize_existing_column(work, "sentiment").value_counts(normalize=True).to_dict()
+            if "sentiment" in work.columns else {}
+        )
+
+        sim = pd.to_numeric(work.get("similarity", pd.Series(dtype=float)), errors="coerce").dropna().clip(0.0, 1.0)
+        similarity_histogram = {}
+        if not sim.empty:
+            bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.01]
+            labels = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
+            bucket = pd.cut(sim, bins=bins, labels=labels, include_lowest=True, right=False)
+            similarity_histogram = {str(k): int(v) for k, v in bucket.value_counts().sort_index().to_dict().items()}
+
+        hourly_distribution = {}
+        time_series = []
+        if "timestamp" in work.columns:
+            valid = work.dropna(subset=["timestamp"]).copy()
+            if not valid.empty:
+                valid["hour"] = valid["timestamp"].dt.hour
+                valid["date"] = valid["timestamp"].dt.date.astype(str)
+
+                hourly_distribution = (
+                    valid["hour"].value_counts().sort_index().to_dict()
+                )
+
+                daily = valid.groupby("date").agg(
+                    count=("title", "count"),
+                    avg_polarity=("polarity", "mean"),
+                    avg_similarity=("similarity", "mean"),
+                ).reset_index()
+                time_series = daily.to_dict("records")
+
+        return {
+            "time_series": time_series,
+            "category_distribution": {str(k): float(v) for k, v in category_distribution.items()},
+            "sentiment_distribution": {str(k): float(v) for k, v in sentiment_distribution.items()},
+            "similarity_histogram": similarity_histogram,
+            "hourly_distribution": {int(k): int(v) for k, v in hourly_distribution.items()},
+        }
+
 
     # ==================== 报告导出 ====================
 
@@ -1743,20 +2520,18 @@ class InformationQualityEvaluator:
         if not isinstance(config, dict):
             raise TypeError("config 必须是 dict")
 
-         # 先以当前配置为基础；若不存在则用默认
-        current = self.config.copy() if isinstance(self.config, dict) else self.get_default_config()
-
-        if "thresholds" not in current or not isinstance(current["thresholds"], dict):
-            current["thresholds"] = self.get_default_config()["thresholds"].copy()
-        if "weights" not in current or not isinstance(current["weights"], dict):
-            current["weights"] = self.get_default_config()["weights"].copy()
+        current = EvaluatorConfig(
+            min_records=int(self.config.min_records),
+            thresholds=self.config.thresholds.copy(),
+            weights=self.config.weights.copy(),
+        )
 
         # 1) min_records
         if "min_records" in config:
             min_records = config["min_records"]
             if not isinstance(min_records, int) or min_records <= 0:
                 raise ValueError("min_records 必须是正整数")
-            current["min_records"] = min_records
+            current.min_records = min_records
 
         # 2) thresholds
         if "thresholds" in config:
@@ -1764,7 +2539,7 @@ class InformationQualityEvaluator:
             if not isinstance(thresholds, dict):
                 raise TypeError("thresholds 必须是 dict")
 
-            allowed_thresholds = set(self.get_default_config()["thresholds"].keys())
+            allowed_thresholds = set(DEFAULT_THRESHOLDS.keys())
             unknown_keys = set(thresholds.keys()) - allowed_thresholds
             if unknown_keys:
                 raise ValueError(f"未知阈值配置项: {sorted(unknown_keys)}")
@@ -1775,7 +2550,7 @@ class InformationQualityEvaluator:
                 v = float(v)
                 if v < 0 or v > 1:
                     raise ValueError(f"thresholds['{k}'] 必须在 [0,1] 区间")
-                current["thresholds"][k] = v
+                current.thresholds[k] = v
 
         # 3) weights
         if "weights" in config:
@@ -1783,7 +2558,7 @@ class InformationQualityEvaluator:
             if not isinstance(weights, dict):
                 raise TypeError("weights 必须是 dict")
 
-            required_keys = set(self.DEFAULT_WEIGHTS.keys())
+            required_keys = set(DEFAULT_WEIGHTS.keys())
             if set(weights.keys()) != required_keys:
                 raise ValueError(f"weights 必须且只能包含: {sorted(required_keys)}")
 
@@ -1800,28 +2575,18 @@ class InformationQualityEvaluator:
             if total <= 0:
                 raise ValueError("weights 总和必须大于 0")
 
-            # 自动归一化
-            current["weights"] = {k: v / total for k, v in cleaned_weights.items()}
+            current.weights = {k: v / total for k, v in cleaned_weights.items()}
 
         self.config = current
-        logger.info(f"评估配置已更新: {self.config}")
+        logger.info(f"评估配置已更新: {self.config.to_dict()}")
 
-    def get_default_config(self) -> Dict[str, Any]:
+    def get_default_config(self) -> EvaluatorConfig:
         """
         获取默认配置
 
         返回默认阈值和权重
         """
-        return {
-            "min_records": 5,  # 最低样本量
-            "thresholds": {
-                "echo_chamber_similarity": self.ECHO_CHAMBER_SIMILARITY_LIMIT,
-                "dominant_category_ratio": self.DOMINANT_CATEGORY_RATIO_LIMIT,
-                "negative_ratio_warning": self.NEGATIVE_RATIO_WARNING,
-                "entertainment_ratio_warning": self.ENTERTAINMENT_RATIO_WARNING,
-            },
-            'weights' : self.DEFAULT_WEIGHTS.copy()
-        }
+        return EvaluatorConfig()
 
 
 # ==================== 辅助函数 ====================
@@ -1879,9 +2644,63 @@ def weighted_average(scores: Dict[str, float], weights: Dict[str, float]) -> flo
 
 # ==================== 测试代码 ====================
 if __name__ == "__main__":
-    # TODO: 加载测试数据
-    # TODO: 初始化评估器
-    # TODO: 执行评估
-    # TODO: 打印报告
-    # TODO: 导出结果
-    pass
+    try:
+        # ===== 路径配置 =====
+        raw_input_path = "./utils/output/history_data.csv"   # 原始浏览记录
+        result_csv_path = "./utils/output/result.csv"        # 构造后的完整结果
+        report_json = "cache/evaluation_report.json"
+        report_md = "cache/evaluation_report.md"
+        report_html = "cache/evaluation_report.html"
+
+        # ===== 读取原始数据 =====
+        raw_df = pd.read_csv(raw_input_path)
+        logger.info(f"已加载原始数据: {raw_input_path}, 共 {len(raw_df)} 条")
+
+        # ===== 初始化三个分析器 =====
+        sentiment_analyzer = SentimentAnalyzer(use_bert=False)  # 可按需传 model_path/use_bert
+        sentiment_analyzer.load_model('./models/sentiment_model_bert')
+        content_classifier = ContentClassifier(model_path="./models/classifier_model.pkl")
+        similarity_analyzer = SimilarityAnalyzer()
+
+        # ===== 构造 category =====
+        df1 = content_classifier.batch_predict(raw_df)
+
+        # ===== 构造 sentiment / polarity =====
+        df2 = sentiment_analyzer.batch_predict(df1, text_column="title", include_emotions=False)
+
+        # ===== 构造 similarity =====
+        df3 = similarity_analyzer.batch_calculate_similarity(df2, text_column="title")
+        if "similarity" not in df3.columns:
+            if "similarity_to_previous" in df3.columns:
+                df3["similarity"] = df3["similarity_to_previous"]
+            else:
+                df3["similarity"] = 0.0
+
+        # ===== 保存构造后的 result.csv =====
+        Path(result_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        df3.to_csv(result_csv_path, index=False, encoding="utf-8-sig")
+        logger.info(f"已生成完整结果文件: {result_csv_path}")
+
+        # ===== 评估 =====
+        evaluator = InformationQualityEvaluator(
+            sentiment_analyzer=sentiment_analyzer,
+            content_classifier=content_classifier,
+            similarity_analyzer=similarity_analyzer
+        )
+        report = evaluator.evaluate(df3, detailed=True)
+
+        # ===== 输出摘要 导出报告 =====
+        print("\n" + "=" * 60)
+        print(evaluator.generate_summary(report))
+        print("=" * 60 + "\n")
+
+        evaluator.export_report(report, report_json, format="json")
+        evaluator.export_report(report, report_md, format="markdown")
+        evaluator.export_report(report, report_html, format="html")
+
+        logger.info("完整流程执行完成：构造 result.csv + 评估 + 报告导出")
+
+    except FileNotFoundError as e:
+        logger.error(f"文件不存在: {e}")
+    except Exception as e:
+        logger.exception(f"执行失败: {e}")
