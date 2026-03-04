@@ -26,7 +26,7 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'  # 设置 HuggingFace 国内
 import logging  # 日志模块
 import pickle  # 模型持久化
 from pathlib import Path  # 跨平台路径处理
-from typing import List, Dict, Optional, Tuple, Any  # 类型标注
+from typing import List, Dict, Optional, Tuple, Any
 import csv  # CSV 文件格式识别
 # ======== 第三方库导入 ========
 import jieba  # 中文分词
@@ -158,7 +158,7 @@ class SentimentAnalyzer:
                  custom_dict_path: Optional[str] = None,
                  model_path: Optional[str] = None,
                  stopwords_path: Optional[str] = './rules/hit_stopwords.txt',
-                 bert_model_name: str = 'bert-base-chinese',
+                 bert_model_name: str = 'hfl/chinese-roberta-wwm-ext',
                  use_bert: bool = False):
         if not CNTEXT_AVAILABLE:
             logger.error("没有安装 cntext 库，建议 pip install cntext")
@@ -166,6 +166,7 @@ class SentimentAnalyzer:
         self.diction = diction  # 保存词典名
         self._cntext_dict_cache: Optional[Dict[str, Any]] = None  # 缓存词典
         self.stopwords_path = stopwords_path  # 停用词路径
+        self._stopwords_cache: set[str] | None = None  # 停用词缓存，避免重复读取文件
         # ===== 加载词典 =====
         if isinstance(self.diction, dict):
             loaded = self.diction
@@ -283,6 +284,36 @@ class SentimentAnalyzer:
             logger.error(f"识别文件格式失败: {e}")
             return 'unknown'
 
+    @staticmethod
+    def _is_empty_text(text: Any) -> bool:
+        """统一判断文本是否为空/无效。"""
+        return text is None or pd.isna(text) or str(text).strip() == ''
+
+    def _empty_cntext_score_result(self) -> Dict[str, Any]:
+        """cntext 打分失败/空文本时的统一返回。"""
+        return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
+
+    def _load_stopwords(self) -> set[str]:
+        """加载停用词并缓存，避免每次分词都重复读文件。"""
+        if self._stopwords_cache is not None:
+            return self._stopwords_cache
+
+        if not self.stopwords_path:
+            self._stopwords_cache = set()
+            return self._stopwords_cache
+
+        try:
+            with open(self.stopwords_path, 'r', encoding='utf-8') as f:
+                self._stopwords_cache = {line.strip() for line in f if line.strip()}
+        except OSError:
+            logger.warning(f"停用词词典不存在: {self.stopwords_path}")
+            self._stopwords_cache = set()
+        except Exception as e:
+            logger.exception(f"加载停用词失败: {e}")
+            self._stopwords_cache = set()
+
+        return self._stopwords_cache
+
     # ==================== 私有方法（内部使用）====================
 
     def _load_custom_dict(self, path: str) -> Dict[str, Any]:
@@ -349,29 +380,17 @@ class SentimentAnalyzer:
         返回:
             List[str]: 分词结果
         """
-        if text is None or pd.isna(text) or str(text).strip() == "":
-            logger.error("传入文本为 None")
+        if self._is_empty_text(text):
+            logger.error("传入文本为空")
             return []
 
         try:
-            words = jieba.lcut(text)
+            words = jieba.lcut(str(text))
         except Exception as e:
             logger.exception(f"出现异常，分词失败: {e}")
             return []
 
-        def load_stopwords(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    stopwords = {line.strip() for line in f if line.strip()}
-                return stopwords
-            except OSError:
-                logger.warning(f"停用词词典不存在: {path}")
-                return {}
-            except Exception as e:
-                logger.exception(f"出现未知错误: {e}")
-                return {}
-
-        stopwords_set = load_stopwords(self.stopwords_path)
+        stopwords_set = self._load_stopwords()
 
         filtered_words = [word for word in words if word not in stopwords_set and len(word.strip()) > 0]
 
@@ -394,13 +413,13 @@ class SentimentAnalyzer:
                 'raw': Dict[str, Any],   # 原始返回，便于调试
             }
         """
-        if text is None or pd.isna(text) or str(text).strip() == "":
-            return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
+        if self._is_empty_text(text):
+            return self._empty_cntext_score_result()
 
         try:
             if ct is None:
                 logger.error("cntext 未安装，无法进行情感分析")
-                return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
+                return self._empty_cntext_score_result()
 
             # 优先使用自定义词典，否则使用缓存的词典
             if self.custom_dict:
@@ -418,7 +437,7 @@ class SentimentAnalyzer:
                     raw = ct.sentiment(str(text), diction=default_dict)
                 except Exception as e:
                     logger.error(f"使用默认词典失败: {e}")
-                    return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
+                    return self._empty_cntext_score_result()
 
             # 调试：打印原始结果
             logger.debug(f"cntext 原始返回: {raw}")
@@ -483,7 +502,7 @@ class SentimentAnalyzer:
 
         except Exception as e:
             logger.exception(f"情感分析失败: {e}")
-            return {'pos': 0, 'neg': 0, 'pos_word': [], 'neg_word': [], 'categories': {}, 'raw': {}}
+            return self._empty_cntext_score_result()
 
     
     def _analyze_emotions_cntext(self, text: str) -> Dict[str, Any]:
@@ -636,8 +655,8 @@ class SentimentAnalyzer:
                 'neg_words': 消极词列表
             }
         """
-        if text is None or pd.isna(text) or str(text).strip() == '':
-            logger.error("传入文本为 None")
+        if self._is_empty_text(text):
+            logger.error("传入文本为空")
             return {
                 'sentiment': self.SENTIMENT_NEUTRAL,
                 'polarity': 0,
@@ -807,7 +826,7 @@ class SentimentAnalyzer:
                 'emotions': 情绪分析结果 (可选)
             }
         """
-        if text is None or pd.isna(text) or str(text).strip() == '':
+        if self._is_empty_text(text):
             logger.error("传入文本为空，无法进行预测")
             return None
 
@@ -854,7 +873,9 @@ class SentimentAnalyzer:
         if include_emotions and 'emotions' in result:
             final_result['emotions'] = result['emotions']
 
-        logger.info(f"预测完成: {sentiment} (置信度: {confidence:.3f})")
+        logger.info(
+            f"预测完成: {final_result['sentiment']} (置信度: {final_result['confidence']:.3f})"
+        )
         return final_result
     
     def batch_predict(self, df: pd.DataFrame,
@@ -1039,7 +1060,6 @@ class SentimentAnalyzer:
         返回:
             Dict[str, Any]: 训练结果
         """
-        global predictions, true_labels, accuracy, f1
         from sklearn.model_selection import train_test_split  # 数据集切分
         from sklearn.preprocessing import LabelEncoder  # 标签编码
         from sklearn.metrics import classification_report, accuracy_score, f1_score  # 评估指标
@@ -1081,19 +1101,22 @@ class SentimentAnalyzer:
         test_dataset = SentimentDataset(X_test, y_test, self.bert_tokenizer, max_length)  # 测试集
 
         # DataLoader 加速参数（CPU/GPU 都可用）
+        loader_num_workers = 2 if self.device is not None and self.device.type == 'cuda' else 0
+        loader_pin_memory = bool(self.device is not None and self.device.type == 'cuda')
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,  # 打乱数据
-            num_workers=2,  # 子进程加载（Windows 建议 0~2）
-            pin_memory=True  # GPU 加速拷贝
+            num_workers=loader_num_workers,  # Windows/CPU 环境更稳妥
+            pin_memory=loader_pin_memory  # 仅在 CUDA 时启用
         )
 
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
-            num_workers=2,
-            pin_memory=True
+            num_workers=loader_num_workers,
+            pin_memory=loader_pin_memory
         )
 
         optimizer = AdamW(self.bert_model.parameters(), lr=learning_rate)  # AdamW 优化器
@@ -1360,11 +1383,7 @@ class SentimentAnalyzer:
         返回:
             float: 相似度分数 (0-1)
         """
-        def is_text_Empty(text) -> bool:
-            if text is None or pd.isna(text) or str(text).strip() == '':
-                return True
-            return False
-        if is_text_Empty(text1) or is_text_Empty(text2):
+        if self._is_empty_text(text1) or self._is_empty_text(text2):
             logger.error("传入的文本1或文本2为空，无法计算余弦相似度")
             return None
 
