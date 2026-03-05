@@ -1738,7 +1738,7 @@ if __name__ == "__main__":
         print("请运行: pip install cntext")
         exit(1)
 
-    print(f"cntext 版本: {ct.__version__}")
+    print(f"cntext 版本: {getattr(ct, '__version__', '未知')}")
 
     if BERT_AVAILABLE:
         print(f"PyTorch 版本: {torch.__version__}")
@@ -1747,8 +1747,62 @@ if __name__ == "__main__":
         print("警告: BERT 功能不可用")
         print("如需使用 BERT，请安装: pip install torch transformers")
 
-    print("choose:1.模型相关；2.词典相关:\n")
-    op = int(input())
+    def run_smoke_tests() -> None:
+        """快速冒烟测试（不依赖训练模型）。"""
+        print("\n=== 运行 sentiment.py 内置冒烟测试 ===")
+        analyzer = SentimentAnalyzer(use_bert=False)
+
+        samples = [
+            "今天心情很好，工作很顺利，太开心了！",
+            "糟糕透了，事情一团糟，我很难过。",
+            "今天下雨了，我按时吃饭然后休息。",
+            "",
+            None,
+        ]
+
+        for i, text in enumerate(samples, start=1):
+            try:
+                result = analyzer.predict(text, include_emotions=True, include_words=False, use_custom_model=False)
+                print(f"[单条预测-{i}] 输入: {repr(text)}")
+                print(f"           输出: {result}")
+            except Exception as e:
+                print(f"[单条预测-{i}] 异常: {e}")
+
+        df = pd.DataFrame({
+            'title': [
+                "非常满意这次体验，服务很好",
+                "真失望，问题一直没解决",
+                "天气一般，心情也一般",
+                None,
+            ],
+            'visit_time': pd.date_range('2024-01-01', periods=4, freq='D')
+        })
+
+        result_df = analyzer.batch_predict(df, text_column='title', include_emotions=True, batch_size=2)
+        print("\n[批量预测结果前几行]")
+        print(result_df.head())
+
+        report = analyzer.generate_sentiment_report(result_df)
+        print("\n[综合报告]")
+        print(report)
+
+        trend = analyzer.analyze_sentiment_trend(result_df, time_column='visit_time', freq='D')
+        print("\n[趋势分析]")
+        print(trend.head())
+
+        sim = analyzer.calculate_semantic_similarity("我今天很开心", "我现在很高兴")
+        print(f"\n[语义相似度] {sim}")
+
+        keywords = analyzer.extract_keywords("今天心情很好，工作效率提升，大家都很开心", top_k=5)
+        print(f"[关键词] {keywords}")
+
+        readability = analyzer.analyze_readability("今天阳光明媚，我们一起去公园散步。")
+        print(f"[可读性] {readability}")
+
+        print("=== 冒烟测试完成 ===\n")
+
+    print("\nchoose:1.模型相关；2.词典相关；3.冒烟测试\n")
+    op = int(input().strip())
 
     if op == 1:
         print("训练并保存模型")
@@ -1783,10 +1837,16 @@ if __name__ == "__main__":
         print(analyzer.predict(text, use_custom_model=True))
 
 
-    if op == 2:
+    elif op == 2:
         d = ct.read_yaml_dict("zh_common_NTUSD.yaml")
         dict_only = d.get("Dictionary", {})
         print("词典键:", d.keys())
         text = "今天心情很好！"
         raw = ct.sentiment(text, diction=dict_only)
         print("raw:", raw)
+
+    elif op == 3:
+        run_smoke_tests()
+
+    else:
+        print("无效选项，请输入 1/2/3")
