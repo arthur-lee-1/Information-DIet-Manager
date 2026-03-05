@@ -62,6 +62,7 @@ def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging
     return logger_obj
 # 初始化 logger
 logger = setup_logger(__name__, "../../logs/sentiment.log")
+MODEL_API_VERSION = "1.0"
 # ==================== 判断依赖是否存在 ====================
 import importlib.util  # 动态检查模块是否安装
 def _pkg_exists(name: str) -> bool:
@@ -83,58 +84,17 @@ else:
         logger.exception("cntext 已安装但导入失败。异常: %r", e)
 # ==================== BERT 相关导入 ====================
 torch = None  # 默认 torch
-Dataset = object  # 默认 Dataset
-DataLoader = None  # 默认 DataLoader
+BertTokenizer = None
+BertForSequenceClassification = None
 BERT_AVAILABLE = False  # 标记 BERT 是否可用
 try:
     import torch  # PyTorch
-    from torch.utils.data import Dataset, DataLoader  # 数据集与加载器
     from transformers import BertTokenizer, BertForSequenceClassification  # BERT 模型
-    from torch.optim import AdamW  # 优化器
-    try:
-        from transformers import get_linear_schedule_with_warmup  # 新版位置
-    except Exception:
-        from transformers.optimization import get_linear_schedule_with_warmup  # 旧版位置
     BERT_AVAILABLE = True  # 标记可用
     logger.info("BERT 相关依赖加载成功：torch=%s, transformers 已可用", torch.__version__)
 except Exception as e:
     BERT_AVAILABLE = False  # 标记不可用
     logger.exception("BERT 相关依赖导入失败。异常: %r", e)
-# ==================== 只有 BERT 可用时才定义 Dataset ====================
-if BERT_AVAILABLE:
-    class SentimentDataset(Dataset):
-        """BERT 情感分析数据集"""
-        def __init__(self, texts: List[str], labels: List[int],
-                     tokenizer, max_length: int = 128):
-            self.texts = texts  # 保存文本
-            self.labels = labels  # 保存标签
-            self.tokenizer = tokenizer  # 保存 tokenizer
-            self.max_length = max_length  # 最大长度
-        def __len__(self):
-            return len(self.texts)  # 返回样本数量
-        def __getitem__(self, idx):
-            text = str(self.texts[idx])  # 取出文本
-            label = self.labels[idx]  # 取出标签
-            # 编码文本
-            encoding = self.tokenizer(
-                text,
-                add_special_tokens=True,
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-                return_attention_mask=True,
-                return_tensors="pt",
-            )
-            return {
-                "input_ids": encoding["input_ids"].squeeze(0),
-                "attention_mask": encoding["attention_mask"].squeeze(0),
-                "label": torch.tensor(label, dtype=torch.long),
-            }
-else:
-    class SentimentDataset:
-        """BERT 不可用时的占位类"""
-        def __init__(self, *args, **kwargs):
-            raise ImportError("BERT 不可用，无法使用 SentimentDataset")
 
 
 @dataclass
@@ -395,192 +355,22 @@ class ModelBackend:
                          batch_size: int,
                          learning_rate: float,
                          max_length: int) -> Dict[str, Any]:
-        from sklearn.model_selection import train_test_split
-        from sklearn.preprocessing import LabelEncoder
-        from sklearn.metrics import classification_report, accuracy_score, f1_score
-
-        logger.info("=" * 50)
-        logger.info("开始 BERT 模型训练")
-        logger.info("=" * 50)
-
-        texts = train_df[text_column].astype(str).tolist()
-        labels = train_df[label_column].tolist()
-
-        self.analyzer.label_encoder = LabelEncoder()
-        labels_encoded = self.analyzer.label_encoder.fit_transform(labels)
-        num_labels = len(self.analyzer.label_encoder.classes_)
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            texts,
-            labels_encoded,
-            test_size=test_size,
-            random_state=42,
-            stratify=labels_encoded
+        """训练逻辑已迁移到 sentiment_train.py。"""
+        raise NotImplementedError(
+            "Training has been moved to sentiment_train.py. "
+            "Please use sentiment_train.train(...) or run_training_pipeline(...)."
         )
-
-        self.analyzer.bert_tokenizer = BertTokenizer.from_pretrained(self.analyzer.bert_model_name)
-        self.analyzer.bert_model = BertForSequenceClassification.from_pretrained(
-            self.analyzer.bert_model_name,
-            num_labels=num_labels
-        )
-        self.analyzer.bert_model.to(self.analyzer.device)
-
-        train_dataset = SentimentDataset(X_train, y_train, self.analyzer.bert_tokenizer, max_length)
-        test_dataset = SentimentDataset(X_test, y_test, self.analyzer.bert_tokenizer, max_length)
-
-        loader_num_workers = 2 if self.analyzer.device is not None and self.analyzer.device.type == 'cuda' else 0
-        loader_pin_memory = bool(self.analyzer.device is not None and self.analyzer.device.type == 'cuda')
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=loader_num_workers,
-            pin_memory=loader_pin_memory
-        )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            num_workers=loader_num_workers,
-            pin_memory=loader_pin_memory
-        )
-
-        optimizer = AdamW(self.analyzer.bert_model.parameters(), lr=learning_rate)
-        total_steps = len(train_loader) * epochs
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=0,
-            num_training_steps=total_steps
-        )
-
-        use_amp = torch.cuda.is_available()
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        training_stats = []
-        accuracy = 0.0
-        f1 = 0.0
-        predictions: List[int] = []
-        true_labels: List[int] = []
-
-        for epoch in range(epochs):
-            self.analyzer.bert_model.train()
-            total_train_loss = 0
-
-            try:
-                from tqdm import tqdm
-                train_iterator = tqdm(train_loader, desc=f"训练 Epoch {epoch + 1}")
-            except ImportError:
-                train_iterator = train_loader
-
-            for batch in train_iterator:
-                input_ids = batch['input_ids'].to(self.analyzer.device)
-                attention_mask = batch['attention_mask'].to(self.analyzer.device)
-                labels_batch = batch['label'].to(self.analyzer.device)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs = self.analyzer.bert_model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels_batch
-                    )
-                    loss = outputs.loss
-
-                total_train_loss += loss.item()
-                scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(self.analyzer.bert_model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
-            avg_train_loss = total_train_loss / max(1, len(train_loader))
-            self.analyzer.bert_model.eval()
-
-            predictions = []
-            true_labels = []
-            total_eval_loss = 0
-
-            with torch.inference_mode():
-                for batch in test_loader:
-                    input_ids = batch['input_ids'].to(self.analyzer.device)
-                    attention_mask = batch['attention_mask'].to(self.analyzer.device)
-                    labels_batch = batch['label'].to(self.analyzer.device)
-                    outputs = self.analyzer.bert_model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels_batch
-                    )
-                    total_eval_loss += outputs.loss.item()
-                    logits = outputs.logits
-                    preds = torch.argmax(logits, dim=1).cpu().numpy()
-                    predictions.extend(preds)
-                    true_labels.extend(labels_batch.cpu().numpy())
-
-            avg_eval_loss = total_eval_loss / max(1, len(test_loader))
-            accuracy = accuracy_score(true_labels, predictions)
-            f1 = f1_score(true_labels, predictions, average='weighted')
-
-            training_stats.append({
-                'epoch': epoch + 1,
-                'train_loss': avg_train_loss,
-                'eval_loss': avg_eval_loss,
-                'accuracy': accuracy,
-                'f1_score': f1
-            })
-
-        predictions_labels = self.analyzer.label_encoder.inverse_transform(predictions)
-        true_labels_original = self.analyzer.label_encoder.inverse_transform(true_labels)
-        report = classification_report(true_labels_original, predictions_labels)
-
-        self.analyzer.use_bert = True
-        return {
-            'model_type': 'BERT',
-            'accuracy': accuracy,
-            'f1_score': f1,
-            'training_stats': training_stats,
-            'classification_report': report
-        }
 
     def train_naive_bayes_model(self,
                                 train_df: pd.DataFrame,
                                 text_column: str,
                                 label_column: str,
                                 test_size: float) -> Dict[str, Any]:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.model_selection import train_test_split
-        from sklearn.naive_bayes import MultinomialNB
-        from sklearn.metrics import classification_report, accuracy_score
-
-        logger.info("=" * 50)
-        logger.info("开始朴素贝叶斯模型训练")
-        logger.info("=" * 50)
-
-        texts = []
-        for text in train_df[text_column]:
-            words = self.analyzer._segment_text(str(text))
-            texts.append(' '.join(words))
-
-        labels = train_df[label_column].values
-        X_train, X_test, y_train, y_test = train_test_split(
-            texts, labels, test_size=test_size, random_state=42
+        """训练逻辑已迁移到 sentiment_train.py。"""
+        raise NotImplementedError(
+            "Training has been moved to sentiment_train.py. "
+            "Please use sentiment_train.train(...) or run_training_pipeline(...)."
         )
-
-        self.analyzer.vectorizer = TfidfVectorizer(max_features=5000)
-        X_train_vec = self.analyzer.vectorizer.fit_transform(X_train)
-        X_test_vec = self.analyzer.vectorizer.transform(X_test)
-
-        self.analyzer.model = MultinomialNB()
-        self.analyzer.model.fit(X_train_vec, y_train)
-
-        y_pred = self.analyzer.model.predict(X_test_vec)
-        accuracy = accuracy_score(y_test, y_pred)
-        report = classification_report(y_test, y_pred)
-
-        return {
-            'model_type': 'Naive Bayes',
-            'accuracy': accuracy,
-            'classification_report': report
-        }
 
     def load_bert_model(self, model_dir: str) -> bool:
         if not BERT_AVAILABLE:
@@ -592,6 +382,17 @@ class ModelBackend:
             self.analyzer.bert_model = BertForSequenceClassification.from_pretrained(model_path)
             self.analyzer.bert_tokenizer = BertTokenizer.from_pretrained(model_path)
             self.analyzer.bert_model.to(self.analyzer.device)
+
+            metadata_json_path = model_path / 'metadata.json'
+            if metadata_json_path.exists():
+                import json
+                with open(metadata_json_path, 'r', encoding='utf-8') as f:
+                    metadata_json = json.load(f)
+                api_version = str(metadata_json.get('api_version', ''))
+                if api_version and api_version != MODEL_API_VERSION:
+                    raise ValueError(
+                        f"模型 api_version 不匹配: model={api_version}, expected={MODEL_API_VERSION}"
+                    )
 
             metadata_path = model_path / 'metadata.pkl'
             if metadata_path.exists():
@@ -720,6 +521,14 @@ class SentimentAnalyzer:
         if self.use_bert:
             logger.info(f"BERT 模式已启用，设备: {self.device}")
         logger.info(f"初始化完成 - 词典: {diction}, BERT: {self.use_bert}")
+
+    @classmethod
+    def load(cls, model_path: Path) -> "SentimentAnalyzer":
+        """稳定推理入口：加载模型并返回可用的分析器实例。"""
+        analyzer = cls(use_bert=False)
+        if not analyzer.load_model(str(model_path)):
+            raise ValueError(f"Failed to load model from: {model_path}")
+        return analyzer
 
     # ==================== 静态方法 ====================
     
@@ -1204,8 +1013,8 @@ class SentimentAnalyzer:
 
         return result_df
 
-    # ==================== 模型训练方法 ====================
-    
+    # ==================== 模型训练方法（已抽离到 sentiment_train.py） ====================
+
     def train_model(self,
                     train_df: pd.DataFrame,
                     text_column: str = 'text',
@@ -1216,37 +1025,11 @@ class SentimentAnalyzer:
                     batch_size: int = 16,
                     learning_rate: float = 2e-5,
                     max_length: int = 128) -> Dict[str, Any]:
-        """
-        训练情感分析模型（支持 BERT 和朴素贝叶斯）
-
-        参数:
-            train_df: 训练数据
-            text_column: 文本列名
-            label_column: 标签列名
-            test_size: 测试集比例
-            use_bert: 是否使用 BERT（默认 True）
-            epochs: 训练轮数（仅 BERT）
-            batch_size: 批次大小（仅 BERT）
-            learning_rate: 学习率（仅 BERT）
-            max_length: 最大序列长度（仅 BERT）
-
-        返回:
-            Dict[str, Any]: 训练结果，包含准确率、损失等信息
-        """
-        if text_column not in train_df.columns or label_column not in train_df.columns:
-            raise ValueError(f"列 '{text_column}' 或 '{label_column}' 不存在")
-
-        logger.info(f"开始训练模型，数据量: {len(train_df)}")
-
-        if use_bert and BERT_AVAILABLE:
-            return self._train_bert_model(
-                train_df, text_column, label_column, test_size,
-                epochs, batch_size, learning_rate, max_length
-            )
-        else:
-            return self._train_naive_bayes_model(
-                train_df, text_column, label_column, test_size
-            )
+        """训练逻辑已迁移到 sentiment_train.py。"""
+        raise NotImplementedError(
+            "Training has been moved to sentiment_train.py. "
+            "Please call sentiment_train.train(...) / sentiment_train.finetune(...)."
+        )
 
     def _train_bert_model(self,
                          train_df: pd.DataFrame,
@@ -1257,12 +1040,13 @@ class SentimentAnalyzer:
                          batch_size: int,
                          learning_rate: float,
                          max_length: int) -> Dict[str, Any]:
-        """使用 BERT 训练模型（委托给 ModelBackend）。"""
-        return self.model_backend.train_bert_model(
+        """兼容旧接口：训练逻辑已迁移到 sentiment_train.py。"""
+        return self.train_model(
             train_df=train_df,
             text_column=text_column,
             label_column=label_column,
             test_size=test_size,
+            use_bert=True,
             epochs=epochs,
             batch_size=batch_size,
             learning_rate=learning_rate,
@@ -1274,12 +1058,17 @@ class SentimentAnalyzer:
                                 text_column: str,
                                 label_column: str,
                                 test_size: float) -> Dict[str, Any]:
-        """使用朴素贝叶斯训练模型（委托给 ModelBackend）。"""
-        return self.model_backend.train_naive_bayes_model(
+        """兼容旧接口：训练逻辑已迁移到 sentiment_train.py。"""
+        return self.train_model(
             train_df=train_df,
             text_column=text_column,
             label_column=label_column,
             test_size=test_size,
+            use_bert=False,
+            epochs=6,
+            batch_size=16,
+            learning_rate=2e-5,
+            max_length=128,
         )
 
     # ==================== 高级分析方法 ====================
@@ -1385,58 +1174,11 @@ class SentimentAnalyzer:
     # ==================== 模型持久化方法 ====================
     
     def save_model(self, path: str) -> None:
-        """
-        保存训练好的模型（支持 BERT 和朴素贝叶斯）
-
-        参数:
-            path: 模型保存路径
-        """
-        save_path = Path(path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if self.use_bert and self.bert_model is not None:
-            # 保存 BERT 模型
-            logger.info("保存 BERT 模型...")
-
-            # 创建模型目录
-            model_dir = save_path.parent / f"{save_path.stem}_bert"
-            model_dir.mkdir(exist_ok=True)
-
-            # 保存模型和 tokenizer
-            self.bert_model.save_pretrained(model_dir)
-            self.bert_tokenizer.save_pretrained(model_dir)
-
-            # 保存标签编码器和其他元数据
-            metadata = {
-                'model_type': 'BERT',
-                'label_encoder': self.label_encoder,
-                'bert_model_name': self.bert_model_name,
-                'diction': self.diction
-            }
-
-            with open(model_dir / 'metadata.pkl', 'wb') as f:
-                pickle.dump(metadata, f)
-
-            logger.info(f"BERT 模型已保存到: {model_dir}")
-
-        elif self.model is not None:
-            # 保存朴素贝叶斯模型
-            logger.info("保存朴素贝叶斯模型...")
-
-            model_data = {
-                'model_type': 'Naive Bayes',
-                'model': self.model,
-                'vectorizer': self.vectorizer,
-                'diction': self.diction
-            }
-
-            with open(path, 'wb') as f:
-                pickle.dump(model_data, f)
-
-            logger.info(f"朴素贝叶斯模型已保存到: {path}")
-        else:
-            logger.error("没有可保存的模型")
-            raise ValueError("No model to save")
+        """模型保存逻辑已迁移到 sentiment_train.py。"""
+        raise NotImplementedError(
+            "Model saving has been moved to sentiment_train.py. "
+            "Please use sentiment_train.run_training_pipeline(...) / sentiment_train.train(...)."
+        )
 
     def load_model(self, path: str) -> bool:
         """
@@ -1805,38 +1547,9 @@ if __name__ == "__main__":
     op = int(input().strip())
 
     if op == 1:
-        print("训练并保存模型")
-
-        df = pd.read_csv("../training_data/converted_dataset.csv")
-        df = df.rename(columns={"label": "sentiment"})
-        analyzer = SentimentAnalyzer(use_bert=True)
-        result = analyzer.train_model(
-            train_df=df,
-            text_column="text",
-            label_column="sentiment",
-            use_bert=True
-        )
-        analyzer.save_model("./models/sentiment_model.pkl")
-        logger.info("✅ 模型保存完成")
-        print(result)
-
-        print("验证加载模型")
-        analyzer = SentimentAnalyzer(use_bert=False)
-        success = analyzer.load_model("models/sentiment_model_bert")
-        text = """
-            我是一个积极乐观的人，我每天都过的很快乐，每天都嬉皮笑脸的，时不时的发出哈哈大笑的声音，你们见到了我千万别奇怪。但是我今天要说的最快乐的一天还是要说那天了。
-
-　　三年级的暑假，阳光明媚，太阳公公早早的就露出了笑脸，我早早的从床上起来了。树上的知了一直在叫个不停。这时候爸爸跑来了我的面前对我说：“天气太热了，走，我们一起去水上乐园玩吧。”我连忙点点头，我最开心了，因为我最喜欢玩水了，天那么热正好降降暑，还有就是我去年就学会了游泳，正好可以游个痛快了。我赶紧准备好了我的游泳帽子和眼镜，照了下镜子，哎呦妈呀，这是谁啊，也太帅了吧。
-
-　　准备就绪，我、爸爸和妈妈一起走进了水上乐园，早早的就挤满了人，爸爸买好票，我急匆匆地跑了进去，接下来就要看我的表演了，换好衣服之后，我下水了，凉飕飕的，太舒服了，我来立马来了个仰泳，像只快活的鱼儿在水里畅游，妈妈督促我不要往水深的地方游，接着我又在水里开始了自由泳，好多小朋友都羡慕我，“哇塞”哥哥姐姐们都很吃惊，我心里像吃了蜜一样甜，好多人说要我和他拍照，我摆出了各种姿势，那种感觉太爽了。
-
-　　时间过的很快，马上就中午了，妈妈说要回去了，我有点依依不舍，我期待下次还能在水里玩个痛快。
-
-　　这天我玩的很开心，我也很快乐。
-        """
-        print(analyzer.predict(text, use_custom_model=True))
-
-
+        print("训练流程已迁移到 sentiment_train.py")
+        print("请使用: python -m src.lsj.src.algorithms.sentiment_train")
+        print("或在代码中调用 sentiment_train.train(...) / sentiment_train.finetune(...)")
     elif op == 2:
         d = ct.read_yaml_dict("zh_common_NTUSD.yaml")
         dict_only = d.get("Dictionary", {})
@@ -1844,9 +1557,7 @@ if __name__ == "__main__":
         text = "今天心情很好！"
         raw = ct.sentiment(text, diction=dict_only)
         print("raw:", raw)
-
     elif op == 3:
         run_smoke_tests()
-
     else:
         print("无效选项，请输入 1/2/3")
