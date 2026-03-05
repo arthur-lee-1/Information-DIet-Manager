@@ -110,6 +110,8 @@ class SentimentTrainDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if torch is None:
+            raise RuntimeError("Torch runtime is unavailable.")
         encoding = self.tokenizer(
             str(self.texts[idx]),
             add_special_tokens=True,
@@ -143,12 +145,14 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
     def __init__(self, config: Optional[TrainConfig] = None):
         if not BERT_AVAILABLE:
             raise ImportError("BERT dependencies unavailable. Install torch and transformers.")
+        if torch is None or BertTokenizer is None or BertForSequenceClassification is None:
+            raise ImportError("BERT runtime dependencies are not fully initialized.")
 
         self.config = config or TrainConfig()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.tokenizer: Optional[Any] = None
-        self.model: Optional[Any] = None
+        self.tokenizer: Any = None
+        self.model: Any = None
         self.label2id: Dict[str, int] = {}
         self.id2label: Dict[int, str] = {}
 
@@ -157,6 +161,8 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
 
     @staticmethod
     def _set_seed(seed: int) -> None:
+        if torch is None:
+            return
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -209,7 +215,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         self.label2id = {label: idx for idx, label in enumerate(unique_labels)}
         self.id2label = {idx: label for label, idx in self.label2id.items()}
 
-    def _to_loader(self, df: pd.DataFrame, shuffle: bool) -> DataLoader[Any]:
+    def _to_loader(self, df: pd.DataFrame, shuffle: bool) -> Any:
         cfg = self.config
         dataset = SentimentTrainDataset(
             texts=df[cfg.text_column].tolist(),
@@ -225,8 +231,15 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             pin_memory=(self.device.type == "cuda"),
         )
 
-    def _evaluate_loader(self, data_loader: DataLoader) -> Dict[str, Any]:
-        self.model.eval()
+    def _evaluate_loader(self, data_loader: Any) -> Dict[str, Any]:
+        if torch is None:
+            raise RuntimeError("Torch runtime is unavailable.")
+        if self.model is None:
+            raise RuntimeError("Model is not initialized. Call train(...) first.")
+        model = self.model
+        if not callable(model):
+            raise RuntimeError("Model is not callable.")
+        model.eval()
         preds, labels = [], []
         total_loss = 0.0
 
@@ -236,7 +249,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
                 attention_mask = batch["attention_mask"].to(self.device)
                 y = batch["label"].to(self.device)
 
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=y)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=y)
                 total_loss += float(outputs.loss.item())
                 pred = torch.argmax(outputs.logits, dim=1)
 
@@ -257,37 +270,120 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         }
 
     def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Dict[str, Any]:
+        if torch is None:
+            raise RuntimeError("Torch runtime is unavailable.")
         cfg = self.config
         self._build_label_mapping(train_df[cfg.label_column].tolist())
 
-        self.tokenizer = BertTokenizer.from_pretrained(cfg.model_name)
-        self.model = BertForSequenceClassification.from_pretrained(
-            cfg.model_name,
-            num_labels=len(self.label2id),
-            id2label=self.id2label,
-            label2id=self.label2id,
-        ).to(self.device)
+        if BertTokenizer is None or BertForSequenceClassification is None:
+            raise RuntimeError("Transformers runtime is unavailable.")
+        tokenizer_cls = BertTokenizer
+        model_cls = BertForSequenceClassification
+
+        hf_token = (
+            os.getenv("HF_TOKEN")
+            or os.getenv("HUGGINGFACE_HUB_TOKEN")
+            or os.getenv("HUGGINGFACE_TOKEN")
+        )
+        model_source = cfg.model_name
+
+        tokenizer_common_kwargs: Dict[str, Any] = {}
+        model_common_kwargs: Dict[str, Any] = {
+            "num_labels": len(self.label2id),
+            "id2label": self.id2label,
+            "label2id": self.label2id,
+            "use_safetensors": False,
+        }
+        if hf_token:
+            tokenizer_common_kwargs["token"] = hf_token
+            model_common_kwargs["token"] = hf_token
+
+        def _load_from_source(source: str, local_only: bool) -> None:
+            tokenizer_kwargs = dict(tokenizer_common_kwargs)
+            tokenizer_kwargs["local_files_only"] = local_only
+            model_kwargs = dict(model_common_kwargs)
+            model_kwargs["local_files_only"] = local_only
+
+            self.tokenizer = tokenizer_cls.from_pretrained(source, **tokenizer_kwargs)
+            self.model = model_cls.from_pretrained(source, **model_kwargs).to(self.device)
+
+        online_error: Optional[Exception] = None
+        try:
+            _load_from_source(model_source, local_only=False)
+            logger.info("Loaded model/tokenizer from remote or cache: %s", model_source)
+        except Exception as e:
+            online_error = e
+            logger.warning("Online model loading failed, switching to offline fallback. err=%r", e)
+
+            local_candidates: List[str] = []
+            if Path(model_source).exists():
+                local_candidates.append(str(Path(model_source)))
+
+            local_model_dir = os.getenv("HF_LOCAL_MODEL_DIR")
+            if local_model_dir and Path(local_model_dir).exists():
+                local_candidates.append(local_model_dir)
+
+            loaded_offline = False
+            last_offline_error: Optional[Exception] = None
+
+            # fallback 1: explicit local paths
+            for candidate in local_candidates:
+                try:
+                    _load_from_source(candidate, local_only=True)
+                    logger.info("Loaded model/tokenizer from local path: %s", candidate)
+                    loaded_offline = True
+                    break
+                except Exception as offline_e:
+                    last_offline_error = offline_e
+                    logger.warning("Offline loading from %s failed: %r", candidate, offline_e)
+
+            # fallback 2: local HF cache only
+            if not loaded_offline:
+                try:
+                    _load_from_source(model_source, local_only=True)
+                    logger.info("Loaded model/tokenizer from local HF cache: %s", model_source)
+                    loaded_offline = True
+                except Exception as offline_cache_e:
+                    last_offline_error = offline_cache_e
+
+            if not loaded_offline:
+                raise RuntimeError(
+                    "Failed to load model in both online and offline modes. "
+                    f"online_error={online_error!r}, offline_error={last_offline_error!r}. "
+                    "You can set HF_TOKEN and optionally HF_LOCAL_MODEL_DIR to a local model directory."
+                )
 
         train_loader = self._to_loader(train_df, shuffle=True)
         val_loader = self._to_loader(val_df, shuffle=False)
 
-        optimizer = AdamW(self.model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+        if AdamW is None or get_linear_schedule_with_warmup is None or torch is None:
+            raise RuntimeError("Torch optimizer/scheduler runtime is unavailable.")
+        optimizer_cls = AdamW
+        scheduler_factory = get_linear_schedule_with_warmup
+
+        if self.model is None:
+            raise RuntimeError("Model init failed.")
+        model = self.model
+        if not callable(model):
+            raise RuntimeError("Model is not callable.")
+
+        optimizer = optimizer_cls(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         total_steps = len(train_loader) * cfg.epochs
-        scheduler = get_linear_schedule_with_warmup(
+        scheduler = scheduler_factory(
             optimizer,
             num_warmup_steps=int(total_steps * cfg.warmup_ratio),
             num_training_steps=total_steps,
         )
 
         use_amp = self.device.type == "cuda"
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         best_f1 = -1.0
         best_state = None
         history: List[Dict[str, Any]] = []
 
         for epoch in range(cfg.epochs):
-            self.model.train()
+            model.train()
             total_loss = 0.0
 
             for batch in train_loader:
@@ -297,11 +393,11 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=y)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=y)
                     loss = outputs.loss
 
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -322,10 +418,10 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
 
             if val_metrics["f1_weighted"] > best_f1:
                 best_f1 = val_metrics["f1_weighted"]
-                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if best_state is not None:
-            self.model.load_state_dict(best_state)
+            model.load_state_dict(best_state)
 
         return {
             "best_val_f1_weighted": best_f1,
@@ -356,6 +452,9 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         cfg = self.config
         save_dir = Path(output_dir) / cfg.model_output_name
         save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("Model/tokenizer is not initialized. Train model before saving.")
 
         self.model.save_pretrained(save_dir)
         self.tokenizer.save_pretrained(save_dir)
