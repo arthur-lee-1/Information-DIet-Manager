@@ -71,7 +71,7 @@ class TransformerTrainingConfig:
     eval_batch_size: int = 8
     learning_rate: float = 1e-5
     weight_decay: float = 0.01
-    num_epochs: int = 3
+    num_epochs: int = 50
     warmup_ratio: float = 0.1
     gradient_accumulation_steps: int = 1
     random_seed: int = 42
@@ -81,6 +81,11 @@ class TransformerTrainingConfig:
     use_fp16: bool = True
     balance_strategy: str = "upsample"
     min_length: int = 3
+    monitor: str = "val_loss"
+    early_stopping_patience: int = 5
+    early_stopping_mode: str = "min"
+    restore_best_weights: bool = True
+    early_stopping_min_delta: float = 1e-4
 
 
 class TextClassificationDataset(Dataset):
@@ -129,6 +134,12 @@ class TransformerTrainer:
             raise ValueError("gradient_accumulation_steps 必须大于 0")
         if config.max_length <= 0:
             raise ValueError("max_length 必须大于 0")
+        if config.monitor != "val_loss":
+            raise ValueError("当前仅支持 monitor='val_loss'")
+        if config.early_stopping_patience <= 0:
+            raise ValueError("early_stopping_patience 必须大于 0")
+        if config.early_stopping_mode != "min":
+            raise ValueError("当前仅支持 early_stopping_mode='min'")
 
         self.config = config
         self.label2id = label2id
@@ -221,15 +232,25 @@ class TransformerTrainer:
             num_training_steps=total_train_steps,
         )
 
+        best_val_loss = float("inf")
         best_val_accuracy = 0.0
         best_metrics = {}
         best_state_dict = None
+        epochs_without_improvement = 0
 
         logger.info("开始 Transformer 训练")
         logger.info(f"训练样本数: {len(train_data)}")
         logger.info(f"验证样本数: {len(val_data)}")
         logger.info(f"训练步数: {total_train_steps}")
         logger.info(f"Warmup 步数: {warmup_steps}")
+        logger.info(
+            "早停配置: monitor=%s, patience=%d, mode=%s, restore_best_weights=%s, min_delta=%.6f",
+            self.config.monitor,
+            self.config.early_stopping_patience,
+            self.config.early_stopping_mode,
+            self.config.restore_best_weights,
+            self.config.early_stopping_min_delta,
+        )
 
         for epoch in range(self.config.num_epochs):
             self.model.train()
@@ -267,22 +288,54 @@ class TransformerTrainer:
                 val_metrics["accuracy"],
             )
 
-            if val_metrics["accuracy"] >= best_val_accuracy:
+            current_val_loss = val_metrics["loss"]
+            improved = current_val_loss < (best_val_loss - self.config.early_stopping_min_delta)
+
+            if improved:
+                best_val_loss = current_val_loss
                 best_val_accuracy = val_metrics["accuracy"]
                 best_metrics = {
                     "train_loss": avg_train_loss,
                     "val_loss": val_metrics["loss"],
                     "val_accuracy": val_metrics["accuracy"],
+                    "best_epoch": epoch + 1,
                 }
                 best_state_dict = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
                 }
+                epochs_without_improvement = 0
+                logger.info(
+                    "val_loss improved to %.4f at epoch %d",
+                    best_val_loss,
+                    epoch + 1,
+                )
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    "val_loss did not improve for %d/%d epoch(s)",
+                    epochs_without_improvement,
+                    self.config.early_stopping_patience,
+                )
 
-        if best_state_dict is not None:
+                if epochs_without_improvement >= self.config.early_stopping_patience:
+                    logger.info(
+                        "Early stopping triggered at epoch %d because val_loss did not improve for %d consecutive epochs",
+                        epoch + 1,
+                        self.config.early_stopping_patience,
+                    )
+                    break
+
+        if self.config.restore_best_weights and best_state_dict is not None:
             self.model.load_state_dict(best_state_dict)
+            logger.info("已恢复验证损失最低时的模型权重")
 
-        logger.info(f"最佳验证准确率: {best_val_accuracy:.4f}")
+        logger.info(
+            "最佳验证结果 - epoch: %s, val_loss: %.4f, val_acc: %.4f",
+            best_metrics.get("best_epoch", "N/A"),
+            best_val_loss,
+            best_val_accuracy,
+        )
         return best_metrics
 
     @torch.no_grad()
