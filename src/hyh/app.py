@@ -563,11 +563,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^chrome-extension://.*$",
+
+    allow_origins=["*"],  # 允许前端请求
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.post("/collect", response_model=IngestAck)
 def collect(item: IngestItem) -> IngestAck:
