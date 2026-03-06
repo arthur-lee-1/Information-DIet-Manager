@@ -3,7 +3,7 @@ const SETTINGS_KEY = "idm_settings";
 const LAST_SENT_BY_TAB_KEY = "idm_last_sent_by_tab";
 
 const DEFAULT_SETTINGS = {
-  ingestEndpoint: "http://127.0.0.1:8000/v1/items",
+  ingestEndpoint: "http://127.0.0.1:8000/collect",
   flushIntervalMin: 1,
   maxBatchSize: 100,
   maxQueueSize: 5000,
@@ -132,25 +132,33 @@ async function flushQueue() {
   if (!queue.length) return;
 
   const batch = queue.slice(0, settings.maxBatchSize);
+  let sentCount = 0;
 
-  try {
-    const resp = await fetch(settings.ingestEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      // CONTRACT: IngestItem 或 IngestItem[]
-      body: JSON.stringify(batch),
-    });
+  for (const item of batch) {
+    try {
+      const resp = await fetch(settings.ingestEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item), // 单条对象
+      });
 
-    if (!resp.ok) {
-      console.warn("[IDM] flush failed:", resp.status);
-      return;
+      if (!resp.ok) {
+        const txt = await resp.text();
+        console.warn("[IDM] flush failed:", resp.status, txt);
+        break; // 停止本轮，避免疯狂请求
+      }
+
+      sentCount += 1;
+    } catch (e) {
+      console.warn("[IDM] flush error:", e?.message || e);
+      break;
     }
+  }
 
-    const rest = queue.slice(batch.length);
+  if (sentCount > 0) {
+    const rest = queue.slice(sentCount);
     await setLocal(QUEUE_KEY, rest);
-    console.log(`[IDM] flushed ${batch.length}, remain ${rest.length}`);
-  } catch (e) {
-    console.warn("[IDM] flush error:", e?.message || e);
+    console.log(`[IDM] flushed ${sentCount}, remain ${rest.length}`);
   }
 }
 
