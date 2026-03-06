@@ -12,6 +12,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except Exception:  # pragma: no cover
+    matplotlib = None
+    plt = None
+    MATPLOTLIB_AVAILABLE = False
+
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -73,6 +84,7 @@ def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging
 logger = setup_logger(__name__, "../../logs/sentiment_train.log")
 MODEL_API_VERSION = "1.0"
 DEFAULT_MODEL_OUTPUT_DIR = str(Path(__file__).resolve().parent / "models")
+DEFAULT_TRAIN_VIS_DIRNAME = "train_vis"
 
 
 @dataclass
@@ -282,6 +294,58 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             "true_ids": labels,
         }
 
+    def _save_training_visualizations(self, save_dir: Path, history: List[Dict[str, Any]]) -> Dict[str, str]:
+        vis_dir = save_dir / DEFAULT_TRAIN_VIS_DIRNAME
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        history_df = pd.DataFrame(history)
+        metrics_csv_path = vis_dir / "metrics.csv"
+        metrics_json_path = vis_dir / "metrics.json"
+        history_df.to_csv(metrics_csv_path, index=False, encoding="utf-8-sig")
+        history_df.to_json(metrics_json_path, orient="records", force_ascii=False, indent=2)
+
+        saved_files: Dict[str, str] = {
+            "metrics_csv": str(metrics_csv_path),
+            "metrics_json": str(metrics_json_path),
+        }
+
+        if not MATPLOTLIB_AVAILABLE or plt is None:
+            logger.warning("matplotlib is unavailable, skipping curve plotting.")
+            return saved_files
+
+        epochs = history_df["epoch"].tolist()
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, history_df["train_loss"].tolist(), marker="o", label="Train Loss")
+        plt.plot(epochs, history_df["val_loss"].tolist(), marker="o", label="Validation Loss")
+        plt.title("Training and Validation Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        loss_curve_path = vis_dir / "loss_curve.png"
+        plt.savefig(loss_curve_path, dpi=150)
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, history_df["train_accuracy"].tolist(), marker="o", label="Train Accuracy")
+        plt.plot(epochs, history_df["val_accuracy"].tolist(), marker="o", label="Validation Accuracy")
+        plt.title("Training and Validation Accuracy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+        metric_curve_path = vis_dir / "metric_curve.png"
+        plt.savefig(metric_curve_path, dpi=150)
+        plt.close()
+
+        saved_files["loss_curve"] = str(loss_curve_path)
+        saved_files["metric_curve"] = str(metric_curve_path)
+        logger.info("Training visualizations saved to: %s", vis_dir)
+        return saved_files
+
     def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Dict[str, Any]:
         if torch is None or F is None:
             raise RuntimeError("Torch runtime is unavailable.")
@@ -407,6 +471,8 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         for epoch in range(cfg.epochs):
             model.train()
             total_loss = 0.0
+            train_preds: List[int] = []
+            train_labels: List[int] = []
 
             for batch in train_loader:
                 input_ids = batch["input_ids"].to(self.device)
@@ -429,18 +495,36 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
                 scheduler.step()
 
                 total_loss += float(loss.item())
+                batch_pred = torch.argmax(outputs.logits.detach(), dim=1)
+                train_preds.extend(batch_pred.cpu().tolist())
+                train_labels.extend(y.detach().cpu().tolist())
 
             train_loss = total_loss / max(1, len(train_loader))
+            train_accuracy = accuracy_score(train_labels, train_preds) if train_labels else 0.0
             val_metrics = self._evaluate_loader(val_loader)
+            current_lr = float(optimizer.param_groups[0]["lr"])
             epoch_record = {
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_metrics["loss"],
+                "train_accuracy": train_accuracy,
                 "val_accuracy": val_metrics["accuracy"],
+                "train_metric": train_accuracy,
+                "val_metric": val_metrics["accuracy"],
                 "val_f1_weighted": val_metrics["f1_weighted"],
+                "learning_rate": current_lr,
             }
             history.append(epoch_record)
-            logger.info("Epoch %d/%d => %s", epoch + 1, cfg.epochs, epoch_record)
+            logger.info(
+                "Epoch %d/%d | train_loss=%.6f | val_loss=%.6f | train_accuracy=%.6f | val_accuracy=%.6f | lr=%.10f",
+                epoch + 1,
+                cfg.epochs,
+                train_loss,
+                float(val_metrics["loss"]),
+                train_accuracy,
+                float(val_metrics["accuracy"]),
+                current_lr,
+            )
 
             current_val_loss = float(val_metrics["loss"])
             if current_val_loss < (best_val_loss - cfg.early_stopping_min_delta):
@@ -465,6 +549,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         return {
             "best_val_loss": best_val_loss,
             "history": history,
+            "visualization_metric_name": "accuracy",
         }
 
     def evaluate_test(self, test_df: pd.DataFrame) -> Dict[str, Any]:
@@ -498,12 +583,18 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         self.model.save_pretrained(save_dir)
         self.tokenizer.save_pretrained(save_dir)
 
+        visualization_files: Dict[str, str] = {}
+        history = training_summary.get("history", [])
+        if history:
+            visualization_files = self._save_training_visualizations(save_dir, history)
+
         metadata = {
             "config": asdict(cfg),
             "label2id": self.label2id,
             "id2label": self.id2label,
             "training_summary": training_summary,
             "test_summary": test_summary,
+            "visualization_files": visualization_files,
             "api_version": MODEL_API_VERSION,
         }
         with open(save_dir / "metadata.json", "w", encoding="utf-8") as f:
