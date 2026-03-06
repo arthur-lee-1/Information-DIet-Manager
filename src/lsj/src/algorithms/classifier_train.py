@@ -3,16 +3,22 @@ import logging
 import random
 import sys
 from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-from scipy.sparse import hstack
-from sklearn.ensemble import VotingClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, accuracy_score
-from sklearn.model_selection import GridSearchCV
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.naive_bayes import MultinomialNB
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    get_linear_schedule_with_warmup,
+)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from classifier import ContentClassifier
@@ -56,6 +62,301 @@ def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging
 logger = setup_logger(__name__, "../../logs/advanced_train.log")
 
 
+@dataclass
+class TransformerTrainingConfig:
+    pretrained_model_name: str = "xlm-roberta-large"
+    output_dir: str = str(Path(__file__).parent / "models" / "classifier_xlm_roberta")
+    max_length: int = 128
+    train_batch_size: int = 4
+    eval_batch_size: int = 8
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.01
+    num_epochs: int = 3
+    warmup_ratio: float = 0.1
+    gradient_accumulation_steps: int = 1
+    random_seed: int = 42
+    val_size: float = 0.1
+    test_size: float = 0.15
+    num_workers: int = 0
+    use_fp16: bool = True
+    balance_strategy: str = "upsample"
+    min_length: int = 3
+
+
+class TextClassificationDataset(Dataset):
+    def __init__(
+        self,
+        texts: List[str],
+        labels: Optional[List[int]],
+        tokenizer,
+        max_length: int,
+    ) -> None:
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        text = str(self.texts[idx]).strip()
+        encoded = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors="pt",
+        )
+
+        item = {key: value.squeeze(0) for key, value in encoded.items()}
+        if self.labels is not None:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+        return item
+
+
+class TransformerTrainer:
+    def __init__(
+        self,
+        label2id: Dict[str, int],
+        config: TransformerTrainingConfig,
+    ) -> None:
+        if not label2id:
+            raise ValueError("label2id 不能为空")
+        if config.train_batch_size <= 0 or config.eval_batch_size <= 0:
+            raise ValueError("batch_size 必须大于 0")
+        if config.gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps 必须大于 0")
+        if config.max_length <= 0:
+            raise ValueError("max_length 必须大于 0")
+
+        self.config = config
+        self.label2id = label2id
+        self.id2label = {idx: label for label, idx in label2id.items()}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            config.pretrained_model_name,
+            num_labels=len(label2id),
+            id2label={int(k): v for k, v in self.id2label.items()},
+            label2id=label2id,
+        )
+        self.model.to(self.device)
+        self.data_collator = DataCollatorWithPadding(
+            tokenizer=self.tokenizer,
+            pad_to_multiple_of=8 if self.device.type == "cuda" else None,
+        )
+        self.use_amp = self.device.type == "cuda" and config.use_fp16
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
+        logger.info(f"训练设备: {self.device}")
+        logger.info(f"预训练模型: {config.pretrained_model_name}")
+        logger.info(f"AMP 混合精度: {'开启' if self.use_amp else '关闭'}")
+
+    def create_dataloader(
+        self,
+        texts: List[str],
+        labels: Optional[List[int]],
+        batch_size: int,
+        shuffle: bool,
+    ) -> DataLoader:
+        dataset = TextClassificationDataset(
+            texts=texts,
+            labels=labels,
+            tokenizer=self.tokenizer,
+            max_length=self.config.max_length,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=self.config.num_workers,
+            collate_fn=self.data_collator,
+            pin_memory=self.device.type == "cuda",
+        )
+
+    def train(
+        self,
+        train_data: List[Dict[str, str]],
+        val_data: List[Dict[str, str]],
+    ) -> Dict[str, float]:
+        train_texts = [item["text"] for item in train_data]
+        train_labels = [self.label2id[item["label"]] for item in train_data]
+        val_texts = [item["text"] for item in val_data]
+        val_labels = [self.label2id[item["label"]] for item in val_data]
+
+        if not train_texts:
+            raise ValueError("训练集为空，无法训练模型")
+        if not val_texts:
+            raise ValueError("验证集为空，无法进行验证")
+
+        train_loader = self.create_dataloader(
+            train_texts,
+            train_labels,
+            batch_size=self.config.train_batch_size,
+            shuffle=True,
+        )
+        val_loader = self.create_dataloader(
+            val_texts,
+            val_labels,
+            batch_size=self.config.eval_batch_size,
+            shuffle=False,
+        )
+
+        total_train_steps = max(
+            1,
+            (len(train_loader) * self.config.num_epochs)
+            // self.config.gradient_accumulation_steps,
+        )
+        warmup_steps = int(total_train_steps * self.config.warmup_ratio)
+
+        optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_train_steps,
+        )
+
+        best_val_accuracy = 0.0
+        best_metrics = {}
+        best_state_dict = None
+
+        logger.info("开始 Transformer 训练")
+        logger.info(f"训练样本数: {len(train_data)}")
+        logger.info(f"验证样本数: {len(val_data)}")
+        logger.info(f"训练步数: {total_train_steps}")
+        logger.info(f"Warmup 步数: {warmup_steps}")
+
+        for epoch in range(self.config.num_epochs):
+            self.model.train()
+            optimizer.zero_grad()
+            running_loss = 0.0
+
+            for step, batch in enumerate(train_loader, start=1):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    outputs = self.model(**batch)
+                    loss = outputs.loss / self.config.gradient_accumulation_steps
+
+                self.scaler.scale(loss).backward()
+                running_loss += loss.item() * self.config.gradient_accumulation_steps
+
+                if (
+                    step % self.config.gradient_accumulation_steps == 0
+                    or step == len(train_loader)
+                ):
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+
+            avg_train_loss = running_loss / max(1, len(train_loader))
+            val_metrics = self.evaluate(val_loader)
+
+            logger.info(
+                "Epoch %d/%d - train_loss: %.4f - val_loss: %.4f - val_acc: %.4f",
+                epoch + 1,
+                self.config.num_epochs,
+                avg_train_loss,
+                val_metrics["loss"],
+                val_metrics["accuracy"],
+            )
+
+            if val_metrics["accuracy"] >= best_val_accuracy:
+                best_val_accuracy = val_metrics["accuracy"]
+                best_metrics = {
+                    "train_loss": avg_train_loss,
+                    "val_loss": val_metrics["loss"],
+                    "val_accuracy": val_metrics["accuracy"],
+                }
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
+                }
+
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+
+        logger.info(f"最佳验证准确率: {best_val_accuracy:.4f}")
+        return best_metrics
+
+    @torch.no_grad()
+    def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
+        self.model.eval()
+        total_loss = 0.0
+        predictions = []
+        references = []
+
+        for batch in dataloader:
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            outputs = self.model(**batch)
+            total_loss += outputs.loss.item()
+
+            preds = torch.argmax(outputs.logits, dim=-1)
+            predictions.extend(preds.detach().cpu().tolist())
+            references.extend(batch["labels"].detach().cpu().tolist())
+
+        avg_loss = total_loss / max(1, len(dataloader))
+        accuracy = accuracy_score(references, predictions) if references else 0.0
+        return {"loss": avg_loss, "accuracy": accuracy}
+
+    @torch.no_grad()
+    def predict(self, data: List[Dict[str, str]]) -> Tuple[List[str], List[float]]:
+        texts = [item["text"] for item in data]
+        dataloader = self.create_dataloader(
+            texts=texts,
+            labels=None,
+            batch_size=self.config.eval_batch_size,
+            shuffle=False,
+        )
+
+        self.model.eval()
+        all_labels = []
+        all_confidences = []
+
+        for batch in dataloader:
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            outputs = self.model(**batch)
+            probs = torch.softmax(outputs.logits, dim=-1)
+            confidence, pred_ids = torch.max(probs, dim=-1)
+
+            all_labels.extend(self.id2label[idx] for idx in pred_ids.detach().cpu().tolist())
+            all_confidences.extend(confidence.detach().cpu().tolist())
+
+        return all_labels, all_confidences
+
+    def save(self, output_dir: str) -> None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        self.model.save_pretrained(output_path)
+        self.tokenizer.save_pretrained(output_path)
+
+        with open(output_path / "label2id.json", "w", encoding="utf-8") as f:
+            json.dump(self.label2id, f, ensure_ascii=False, indent=2)
+
+        with open(output_path / "id2label.json", "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in self.id2label.items()}, f, ensure_ascii=False, indent=2)
+
+        with open(output_path / "training_config.json", "w", encoding="utf-8") as f:
+            json.dump(asdict(self.config), f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Transformer 模型已保存到: {output_path}")
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def step1_load_and_inspect(data_path):
     """
     步骤1：加载数据并进行初步检查
@@ -70,18 +371,30 @@ def step1_load_and_inspect(data_path):
         with open(data_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
+        if not isinstance(data, list):
+            logger.error("数据格式错误：根节点必须为列表")
+            sys.exit(1)
+
         logger.info(f"加载数据成功: {data_path}")
         logger.info(f"总数据量: {len(data)} 条")
 
         if data:
             logger.info("数据结构示例（第1条）:")
             first_item = data[0]
-            for key, value in first_item.items():
-                logger.info(f"  {key}: {value}")
+            if isinstance(first_item, dict):
+                for key, value in first_item.items():
+                    logger.info(f"  {key}: {value}")
+            else:
+                logger.warning(f"第1条数据不是对象类型: {type(first_item)}")
 
         logger.info("开始检查数据完整性...")
         missing_count = 0
         for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                logger.warning(f"第{i + 1}条数据不是对象类型")
+                missing_count += 1
+                continue
+
             if 'input' not in item or 'label' not in item:
                 logger.warning(f"第{i + 1}条数据缺失字段")
                 missing_count += 1
@@ -168,7 +481,7 @@ def step3_check_duplicates(data):
 
         total_texts = len(data)
         unique_texts = len(text_counts)
-        duplicate_rate = (total_texts - unique_texts) / total_texts * 100
+        duplicate_rate = (total_texts - unique_texts) / total_texts * 100 if total_texts else 0.0
 
         if duplicates:
             logger.warning("发现重复数据")
@@ -209,7 +522,7 @@ def step4_check_label_distribution(data):
 
         min_count = min(label_counts.values())
         max_count = max(label_counts.values())
-        balance_ratio = min_count / max_count
+        balance_ratio = min_count / max_count if max_count else 0.0
 
         logger.info("平衡度分析:")
         logger.info(f"  最少类别: {min_count} 条")
@@ -289,10 +602,11 @@ def step6_remove_short_texts(data, min_length=3):
                 removed_texts.append(text)
 
         removed_count = original_count - len(filtered_data)
+        removed_ratio = (removed_count / original_count * 100) if original_count else 0.0
 
         logger.info(f"原始数据: {original_count} 条")
         logger.info(f"过滤后: {len(filtered_data)} 条")
-        logger.info(f"移除: {removed_count} 条 ({removed_count / original_count * 100:.1f}%)")
+        logger.info(f"移除: {removed_count} 条 ({removed_ratio:.1f}%)")
 
         if removed_texts:
             logger.info("移除的文本示例（前5个）:")
@@ -322,10 +636,11 @@ def step7_remove_duplicates(data):
                 dedup_data.append(item)
 
         removed_count = original_count - len(dedup_data)
+        removed_ratio = (removed_count / original_count * 100) if original_count else 0.0
 
         logger.info(f"原始数据: {original_count} 条")
         logger.info(f"去重后: {len(dedup_data)} 条")
-        logger.info(f"移除: {removed_count} 条 ({removed_count / original_count * 100:.1f}%)")
+        logger.info(f"移除: {removed_count} 条 ({removed_ratio:.1f}%)")
 
         return dedup_data
 
@@ -348,6 +663,9 @@ def step8_balance_data(data, strategy='downsample'):
         logger.info("原始分布:")
         for label, items in sorted(label_groups.items()):
             logger.info(f"  {label}: {len(items)} 条")
+
+        if not label_groups:
+            return data
 
         if strategy == 'downsample':
             min_count = min(len(items) for items in label_groups.values())
@@ -388,7 +706,7 @@ def step8_balance_data(data, strategy='downsample'):
 
 def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'):
     """
-    加载并准备训练数据（使用 data_cleaning 模块的完整清洗流程）
+    加载并准备训练数据（使用现有清洗流程）
 
     Args:
         data_path: 数据文件路径
@@ -398,47 +716,36 @@ def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'
     Returns:
         清洗后的数据列表
     """
-    logger.info("="*60)
+    logger.info("=" * 60)
     logger.info("开始完整数据清洗流程")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
     try:
-        # 步骤1：加载并检查数据
         data = step1_load_and_inspect(data_path)
-
-        # 步骤2：检查文本长度
         step2_check_text_length(data)
-
-        # 步骤3：检查重复数据
         step3_check_duplicates(data)
-
-        # 步骤4：检查标签分布
         step4_check_label_distribution(data)
-
-        # 步骤5：检查标签一致性
         step5_check_label_consistency(data)
 
-        # 转换数据格式
         logger.info("转换数据格式...")
         formatted_data = []
         for item in data:
-            text = item.get('input', '').strip()
-            label = item.get('label', '')
+            if not isinstance(item, dict):
+                continue
+
+            raw_text = item.get('input', '')
+            raw_label = item.get('label', '')
+            text = str(raw_text).strip() if raw_text is not None else ''
+            label = str(raw_label).strip() if raw_label is not None else ''
             if text and label:
                 formatted_data.append({'input': text, 'label': label})
 
         logger.info(f"格式化后数据: {len(formatted_data)} 条")
 
-        # 步骤6：移除短文本
         cleaned_data = step6_remove_short_texts(formatted_data, min_length=min_length)
-
-        # 步骤7：去重
         cleaned_data = step7_remove_duplicates(cleaned_data)
-
-        # 步骤8：平衡数据
         cleaned_data = step8_balance_data(cleaned_data, strategy=balance_strategy)
 
-        # 转换为训练格式
         final_data = []
         for item in cleaned_data:
             final_data.append({
@@ -446,322 +753,191 @@ def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'
                 'label': item['label']
             })
 
-        logger.info("="*60)
+        if not final_data:
+            logger.error("清洗后数据为空，无法继续训练")
+            sys.exit(1)
+
+        logger.info("=" * 60)
         logger.info(f"数据清洗完成，最终数据量: {len(final_data)} 条")
-        logger.info("="*60)
+        logger.info("=" * 60)
 
         return final_data
 
-    except Exception as e:
+    except Exception:
         logger.exception("加载和准备数据时发生错误")
         sys.exit(1)
 
 
-def create_stratified_split(data, test_size=0.15, random_seed=42):
-    """
-    创建分层划分的训练集和测试集
-
-    Args:
-        data: 数据列表
-        test_size: 测试集比例
-        random_seed: 随机种子
-
-    Returns:
-        (train_data, test_data)
-    """
-    logger.info(f"划分数据集（测试集比例: {test_size}）")
+def create_stratified_splits(
+    data: List[Dict[str, str]],
+    test_size: float = 0.15,
+    val_size: float = 0.1,
+    random_seed: int = 42,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
+    logger.info(f"划分数据集（test_size={test_size}, val_size={val_size}）")
 
     try:
-        random.seed(random_seed)
+        if not data:
+            raise ValueError("数据为空，无法划分数据集")
+        if not (0 < test_size < 1):
+            raise ValueError("test_size 必须在 0 和 1 之间")
+        if not (0 < val_size < 1):
+            raise ValueError("val_size 必须在 0 和 1 之间")
+        if test_size + val_size >= 1:
+            raise ValueError("test_size + val_size 必须小于 1")
 
-        # 按标签分组
-        label_groups = {}
-        for item in data:
-            label = item['label']
-            if label not in label_groups:
-                label_groups[label] = []
-            label_groups[label].append(item)
+        texts = [item['text'] for item in data]
+        labels = [item['label'] for item in data]
+        label_counts = Counter(labels)
+        min_label_count = min(label_counts.values()) if label_counts else 0
 
-        train_data = []
-        test_data = []
+        use_stratify = min_label_count >= 2
+        if not use_stratify:
+            logger.warning("部分类别样本数不足 2，降级为非分层划分")
 
-        # 分层采样
-        for label, items in label_groups.items():
-            random.shuffle(items)
-            split_idx = int(len(items) * (1 - test_size))
+        train_val_texts, test_texts, train_val_labels, test_labels = train_test_split(
+            texts,
+            labels,
+            test_size=test_size,
+            random_state=random_seed,
+            stratify=labels if use_stratify else None,
+        )
 
-            train_data.extend(items[:split_idx])
-            test_data.extend(items[split_idx:])
+        adjusted_val_size = val_size / (1 - test_size)
+        train_val_counts = Counter(train_val_labels)
+        use_val_stratify = train_val_counts and min(train_val_counts.values()) >= 2
+        if not use_val_stratify:
+            logger.warning("验证集划分阶段部分类别样本数不足 2，降级为非分层划分")
 
-        # 打乱数据
-        random.shuffle(train_data)
-        random.shuffle(test_data)
+        train_texts, val_texts, train_labels, val_labels = train_test_split(
+            train_val_texts,
+            train_val_labels,
+            test_size=adjusted_val_size,
+            random_state=random_seed,
+            stratify=train_val_labels if use_val_stratify else None,
+        )
+
+        train_data = [{'text': text, 'label': label} for text, label in zip(train_texts, train_labels)]
+        val_data = [{'text': text, 'label': label} for text, label in zip(val_texts, val_labels)]
+        test_data = [{'text': text, 'label': label} for text, label in zip(test_texts, test_labels)]
+
+        if not train_data or not val_data or not test_data:
+            raise ValueError("训练/验证/测试集存在空集，无法继续训练")
 
         logger.info(f"训练集: {len(train_data)} 条")
+        logger.info(f"验证集: {len(val_data)} 条")
         logger.info(f"测试集: {len(test_data)} 条")
 
-        return train_data, test_data
+        return train_data, val_data, test_data
 
-    except Exception as e:
+    except Exception:
         logger.exception("划分数据集时发生错误")
         sys.exit(1)
 
 
-def extract_advanced_features(texts, classifier):
-    """
-    提取多层次特征
-
-    Args:
-        texts: 文本列表
-        classifier: 分类器实例
-
-    Returns:
-        处理后的文本列表
-    """
-    try:
-        processed = []
-        for text in texts:
-            words = classifier._segment_text(text)
-            clean_words = classifier._remove_stopwords(words)
-            processed.append(' '.join(clean_words))
-        return processed
-    except Exception as e:
-        logger.exception("提取特征时发生错误")
-        raise
+def build_label_mappings(data: List[Dict[str, str]]) -> Tuple[Dict[str, int], Dict[int, str]]:
+    labels = sorted({item['label'] for item in data if item.get('label')})
+    if not labels:
+        raise ValueError("未找到有效标签，无法构建标签映射")
+    label2id = {label: idx for idx, label in enumerate(labels)}
+    id2label = {idx: label for label, idx in label2id.items()}
+    logger.info(f"标签映射: {label2id}")
+    return label2id, id2label
 
 
-def train_with_cross_validation(train_data, n_folds=5):
-    """
-    使用交叉验证训练模型并进行 GridSearchCV 超参数调优
-
-    Args:
-        train_data: 训练数据
-        n_folds: 交叉验证折数
-
-    Returns:
-        训练好的分类器实例, 交叉验证结果字典, 训练集准确率
-    """
-    logger.info(f"使用 {n_folds} 折交叉验证训练模型（包含 GridSearchCV 调参）")
+def train_transformer_model(
+    train_data: List[Dict[str, str]],
+    val_data: List[Dict[str, str]],
+    config: TransformerTrainingConfig,
+) -> Tuple[ContentClassifier, Dict[str, float]]:
+    logger.info("开始基于 Transformer 的文本分类训练")
 
     try:
-        # 准备数据
-        texts = [item['text'] for item in train_data]
-        labels = [item['label'] for item in train_data]
+        if not train_data:
+            logger.error("训练数据为空，无法开始训练")
+            sys.exit(1)
+        if not val_data:
+            logger.error("验证数据为空，无法开始训练")
+            sys.exit(1)
 
-        classifier = ContentClassifier()
+        label2id, _ = build_label_mappings(train_data + val_data)
+        trainer = TransformerTrainer(label2id=label2id, config=config)
+        train_metrics = trainer.train(train_data=train_data, val_data=val_data)
+        trainer.save(config.output_dir)
 
-        # 预处理
-        logger.info("预处理文本...")
-        processed_texts = extract_advanced_features(texts, classifier)
-
-        # 优化的特征提取配置
-        feature_configs = [
-            {
-                'name': '词级(1-5gram)',
-                'vectorizer': TfidfVectorizer(
-                    max_features=50000,  # 增加特征数
-                    min_df=2,
-                    max_df=0.80,  # 降低最大文档频率阈值
-                    ngram_range=(1, 5),  # 扩展到5-gram
-                    sublinear_tf=True,
-                    norm='l2',
-                    use_idf=True,
-                    smooth_idf=True
-                )
-            },
-            {
-                'name': '字符级(2-6gram)',
-                'vectorizer': TfidfVectorizer(
-                    max_features=30000,  # 增加字符特征数
-                    analyzer='char',
-                    ngram_range=(2, 6),  # 扩展到6-gram
-                    min_df=2,  # 降低最小文档频率
-                    max_df=0.85,
-                    sublinear_tf=True,
-                    norm='l2'
-                )
-            },
-            {
-                'name': '词级(1-2gram)高频',
-                'vectorizer': TfidfVectorizer(
-                    max_features=15000,
-                    min_df=5,  # 只保留高频词
-                    max_df=0.70,
-                    ngram_range=(1, 2),
-                    sublinear_tf=True
-                )
-            }
-        ]
-
-        # 提取特征
-        logger.info("提取多层次特征...")
-        feature_matrices = []
-        vectorizers = []
-
-        for config in feature_configs:
-            vec = config['vectorizer']
-            X = vec.fit_transform(processed_texts)
-            feature_matrices.append(X)
-            vectorizers.append(vec)
-            logger.info(f"  {config['name']}: {X.shape[1]} 维")
-
-        # 合并特征
-        X_combined = hstack(feature_matrices)
-        logger.info(f"总特征维度: {X_combined.shape[1]}")
-
-        # 优化的模型配置
-        models = {
-            'NB': MultinomialNB(alpha=0.01),  # 降低平滑参数
-            'LR': LogisticRegression(
-                max_iter=30000,  # 增加迭代次数确保收敛
-                C=5.0,  # 增加正则化强度
-                solver='saga',  # 使用更快的求解器
-                class_weight='balanced',
-                random_state=42,
-                verbose=0,
-                # n_jobs=-1  # 使用所有CPU核心
-            )
-        }
-
-        # 交叉验证评估每个模型
-        logger.info("交叉验证评估（单模型）")
-
-        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-        cv_results = {}
-
-        for name, model in models.items():
-            logger.info(f"评估 {name} 模型...")
-            scores = cross_val_score(
-                model, X_combined, labels,
-                cv=cv, scoring='accuracy', n_jobs=1
-            )
-            cv_results[name] = scores
-            logger.info(f"  准确率: {scores.mean():.4f} (+/- {scores.std() * 2:.4f})")
-
-        # 训练最终集成模型并进行 GridSearchCV 调参
-        logger.info("训练最终集成模型并进行 GridSearchCV 调参")
-
-        ensemble = VotingClassifier(
-            estimators=[
-                ('nb', models['NB']),
-                ('lr', models['LR'])
-            ],
-            voting='soft',
-            weights=[1, 3]
+        classifier = ContentClassifier(
+            model_path=config.output_dir,
+            pretrained_model_name=config.pretrained_model_name,
+            max_length=config.max_length,
+            inference_batch_size=config.eval_batch_size,
         )
 
-        # 优化的超参数网格
-        param_grid = {
-            'lr__C': [3.0, 5.0, 7.0, 10.0],  # 更大的C值范围
-            'lr__max_iter': [30000],  # 固定更大的迭代次数
-            'lr__solver': ['saga', 'lbfgs'],  # 测试不同求解器
-            'nb__alpha': [0.001, 0.01, 0.03, 0.05],  # 更小的alpha值
-            'weights': [[1, 2], [1, 3], [1, 4], [1, 5]]  # 测试不同的投票权重
-        }
+        return classifier, train_metrics
 
-        logger.info("使用 GridSearchCV 进行超参数搜索（可能较慢）...")
-        grid_search = GridSearchCV(
-            estimator=ensemble,
-            param_grid=param_grid,
-            cv=cv,
-            scoring='accuracy',
-            # n_jobs=-1,  # 使用所有CPU核心加速
-            refit=True,
-            verbose=2,
-            error_score='raise'  # 遇到错误时抛出异常
-        )
-
-        grid_search.fit(X_combined, labels)
-
-        logger.info(f"最佳参数: {grid_search.best_params_}")
-        logger.info(f"最佳交叉验证得分: {grid_search.best_score_:.4f}")
-
-        # 使用最佳模型
-        best_ensemble = grid_search.best_estimator_
-        classifier.model = best_ensemble
-        classifier.vectorizer = vectorizers[0]
-        classifier.char_vectorizer = vectorizers[1]
-        classifier.high_freq_vectorizer = vectorizers[2]  # 保存第三个向量化器
-
-        # 训练集准确率
-        train_pred = classifier.model.predict(X_combined)
-        train_acc = accuracy_score(labels, train_pred)
-
-        logger.info(f"训练集准确率（使用最佳模型）: {train_acc:.4f}")
-        logger.info(f"交叉验证（LR）平均准确率: {cv_results['LR'].mean():.4f}")
-
-        return classifier, cv_results, train_acc
-
-    except Exception as e:
-        logger.exception("训练模型时发生错误")
+    except Exception:
+        logger.exception("Transformer 训练失败")
         sys.exit(1)
 
 
-def evaluate_on_test_set(classifier, test_data):
+def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str, str]]):
     """
     在测试集上评估模型
-
-    Args:
-        classifier: 训练好的分类器
-        test_data: 测试数据
-
-    Returns:
-        评估结果
     """
     logger.info("测试集评估")
 
     try:
+        if not test_data:
+            logger.error("测试集为空，无法评估")
+            sys.exit(1)
+
         test_texts = [item['text'] for item in test_data]
         test_labels = [item['label'] for item in test_data]
 
-        # 预处理
-        processed_texts = extract_advanced_features(test_texts, classifier)
-
-        # 提取特征（使用所有三个向量化器）
-        X_test_word = classifier.vectorizer.transform(processed_texts)
-        X_test_char = classifier.char_vectorizer.transform(processed_texts)
-        X_test_high_freq = classifier.high_freq_vectorizer.transform(processed_texts)
-        X_test = hstack([X_test_word, X_test_char, X_test_high_freq])
-
-        # 预测
-        predictions = classifier.model.predict(X_test)
+        predictions, confidences = classifier.predict_texts(
+            test_texts,
+            return_confidence=True,
+            batch_size=classifier.inference_batch_size,
+        )
         test_acc = accuracy_score(test_labels, predictions)
 
         logger.info(f"测试准确率: {test_acc:.4f}")
+        if confidences:
+            logger.info(f"平均置信度: {float(np.mean(confidences)):.4f}")
 
-        # 详细报告
         logger.info("详细分类报告:")
         report = classification_report(test_labels, predictions, digits=4)
         for line in report.split('\n'):
             if line.strip():
                 logger.info(f"  {line}")
 
-        # 错误分析
         errors = []
-        for i, (true, pred, text) in enumerate(zip(test_labels, predictions, test_texts)):
+        for true, pred, text, conf in zip(test_labels, predictions, test_texts, confidences):
             if true != pred:
                 errors.append({
                     'text': text,
                     'true': true,
-                    'pred': pred
+                    'pred': pred,
+                    'confidence': conf,
                 })
 
-        error_rate = len(errors) / len(test_labels) * 100
+        error_rate = len(errors) / len(test_labels) * 100 if test_labels else 0.0
         logger.info(f"错误样本数: {len(errors)}/{len(test_labels)} ({error_rate:.2f}%)")
 
         if errors:
             logger.info("前10个错误样本:")
             for i, err in enumerate(errors[:10], 1):
                 logger.info(f"  [{i}] 文本: {err['text'][:60]}...")
-                logger.info(f"      真实: {err['true']} | 预测: {err['pred']}")
+                logger.info(
+                    f"      真实: {err['true']} | 预测: {err['pred']} | 置信度: {err['confidence']:.4f}"
+                )
 
         return {
             'accuracy': test_acc,
             'errors': errors,
-            'report': report
+            'report': report,
         }
 
-    except Exception as e:
+    except Exception:
         logger.exception("评估测试集时发生错误")
         sys.exit(1)
 
@@ -779,47 +955,47 @@ def main():
             logger.error(f"数据文件不存在: {data_path}")
             sys.exit(1)
 
-        logger.info("=" * 60)
-        logger.info("高级模型训练 - 目标准确率 98%+")
-        logger.info("=" * 60)
+        config = TransformerTrainingConfig()
+        set_seed(config.random_seed)
 
-        # 1. 加载和清洗数据（使用完整清洗流程）
+        logger.info("=" * 60)
+        logger.info("Transformer 文本分类训练 - 基于 xlm-roberta-large")
+        logger.info("=" * 60)
+        logger.info(f"训练配置: {asdict(config)}")
+
         logger.info("步骤 1: 完整数据清洗")
         clean_data = load_and_prepare_data(
             data_path,
-            min_length=3,
-            balance_strategy='upsample'  # 使用下采样平衡数据
+            min_length=config.min_length,
+            balance_strategy=config.balance_strategy,
         )
 
-        # 2. 划分数据集
-        logger.info("步骤 2: 划分数据集")
-        train_data, test_data = create_stratified_split(clean_data, test_size=0.15)
+        logger.info("步骤 2: 划分训练/验证/测试集")
+        train_data, val_data, test_data = create_stratified_splits(
+            clean_data,
+            test_size=config.test_size,
+            val_size=config.val_size,
+            random_seed=config.random_seed,
+        )
 
-        # 3. 交叉验证训练（含 GridSearchCV）
-        logger.info("步骤 3: 交叉验证训练（含调参）")
-        classifier, cv_results, train_acc = train_with_cross_validation(train_data, n_folds=5)
+        logger.info("步骤 3: Transformer 训练")
+        classifier, train_metrics = train_transformer_model(
+            train_data=train_data,
+            val_data=val_data,
+            config=config,
+        )
 
-        # 4. 测试集评估
         logger.info("步骤 4: 测试集评估")
         test_results = evaluate_on_test_set(classifier, test_data)
 
-        # 5. 保存模型
-        logger.info("保存模型")
-
-        model_folder = Path(__file__).parent / "models"
-        model_folder.mkdir(exist_ok=True)
-        model_path = model_folder / "classifier_model.pkl"
-
-        classifier.save_model(str(model_path))
-        logger.info(f"模型已保存: {model_path}")
-
-        # 6. 最终总结
         logger.info("=" * 60)
         logger.info("训练总结")
         logger.info("=" * 60)
-        logger.info(f"训练集准确率: {train_acc:.4f}")
-        logger.info(f"交叉验证准确率: {cv_results['LR'].mean():.4f} (+/- {cv_results['LR'].std() * 2:.4f})")
+        logger.info(f"训练损失: {train_metrics.get('train_loss', 0.0):.4f}")
+        logger.info(f"验证损失: {train_metrics.get('val_loss', 0.0):.4f}")
+        logger.info(f"验证准确率: {train_metrics.get('val_accuracy', 0.0):.4f}")
         logger.info(f"测试集准确率: {test_results['accuracy']:.4f}")
+        logger.info(f"模型目录: {config.output_dir}")
         logger.info("=" * 60)
 
         if test_results['accuracy'] >= 0.98:
@@ -828,20 +1004,20 @@ def main():
             logger.info("模型表现良好，准确率超过95%")
             logger.info("改进建议:")
             logger.info("  1. 增加更多训练数据")
-            logger.info("  2. 分析错误样本，改进特征工程")
-            logger.info("  3. 尝试更复杂的模型（如深度学习）")
+            logger.info("  2. 分析错误样本，优化标注质量")
+            logger.info("  3. 适当增大 max_length 或训练轮次")
         else:
             logger.info(f"当前准确率: {test_results['accuracy']:.2%}")
             logger.info("改进建议:")
             logger.info("  1. 检查数据质量和标注一致性")
-            logger.info("  2. 增加更多训练数据（目标15000+）")
-            logger.info("  3. 优化特征提取方法")
-            logger.info("  4. 调整模型超参数")
+            logger.info("  2. 增加更多训练数据")
+            logger.info("  3. 调整学习率、batch size、epoch 数")
+            logger.info("  4. 针对长文本适度提高 max_length")
 
     except KeyboardInterrupt:
         logger.warning("用户中断操作")
         sys.exit(0)
-    except Exception as e:
+    except Exception:
         logger.exception("程序执行失败")
         sys.exit(1)
 
