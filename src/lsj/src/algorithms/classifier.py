@@ -457,4 +457,4 @@ if __name__ == "__main__":
 
     history_df = pd.read_json('utils/output/history_data.jsonl', lines=True)
     result_df = classifier.batch_predict(history_df)
-    result_df.to_csv('../utils/output/result.csv', index=False)
+    result_df.to_csv('utils/output/result.csv', index=False)
