@@ -5,7 +5,7 @@ import os
 import pickle
 import random
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,8 +14,10 @@ import pandas as pd
 
 try:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     MATPLOTLIB_AVAILABLE = True
 except Exception:  # pragma: no cover
     matplotlib = None
@@ -38,13 +40,14 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 try:
     import torch
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset
     from torch.optim import AdamW
+    from torch.utils.data import DataLoader, Dataset
     from transformers import (
         BertForSequenceClassification,
         BertTokenizer,
         get_linear_schedule_with_warmup,
     )
+
     BERT_AVAILABLE = True
 except Exception:  # pragma: no cover
     torch = None
@@ -96,7 +99,13 @@ class TrainConfig:
 
 
 class SentimentTrainDataset(Dataset):
-    def __init__(self, texts: List[str], labels: List[int], tokenizer: Any, max_length: int):
+    def __init__(
+        self,
+        texts: List[str],
+        labels: List[int],
+        tokenizer: Any,
+        max_length: int,
+    ) -> None:
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
@@ -108,6 +117,7 @@ class SentimentTrainDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if torch is None:
             raise RuntimeError("Torch runtime is unavailable.")
+
         encoding = self.tokenizer(
             str(self.texts[idx]),
             add_special_tokens=True,
@@ -137,7 +147,6 @@ class BasePredictor(ABC):
 
 
 class SentimentTrainer(BaseTrainer, BasePredictor):
-
     def __init__(self, config: Optional[TrainConfig] = None):
         if not BERT_AVAILABLE:
             raise ImportError("BERT dependencies unavailable. Install torch and transformers.")
@@ -159,6 +168,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
     def _set_seed(seed: int) -> None:
         if torch is None:
             return
+
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -168,7 +178,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
     def load_and_clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
         cfg = self.config
         required = {cfg.text_column, cfg.label_column}
-        missing = [c for c in required if c not in data.columns]
+        missing = [column for column in required if column not in data.columns]
         if missing:
             raise ValueError(f"Missing columns: {missing}")
 
@@ -232,11 +242,14 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             raise RuntimeError("Torch runtime is unavailable.")
         if self.model is None:
             raise RuntimeError("Model is not initialized. Call train(...) first.")
+
         model = self.model
         if not callable(model):
             raise RuntimeError("Model is not callable.")
+
         model.eval()
-        preds, labels = [], []
+        preds: List[int] = []
+        labels: List[int] = []
         total_loss = 0.0
 
         with torch.inference_mode():
@@ -258,7 +271,10 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
                 labels.extend(y.cpu().tolist())
 
         precision, recall, f1, _ = precision_recall_fscore_support(
-            labels, preds, average="weighted", zero_division=0
+            labels,
+            preds,
+            average="weighted",
+            zero_division=0,
         )
         return {
             "loss": total_loss / max(1, len(data_loader)),
@@ -270,7 +286,11 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             "true_ids": labels,
         }
 
-    def _save_training_visualizations(self, save_dir: Path, history: List[Dict[str, Any]]) -> Dict[str, str]:
+    def _save_training_visualizations(
+        self,
+        save_dir: Path,
+        history: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
         vis_dir = save_dir / DEFAULT_TRAIN_VIS_DIRNAME
         vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -325,6 +345,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
     def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Dict[str, Any]:
         if torch is None or F is None:
             raise RuntimeError("Torch runtime is unavailable.")
+
         cfg = self.config
         if not (0.0 <= float(cfg.label_smoothing) < 1.0):
             raise ValueError(f"label_smoothing must be in [0.0, 1.0), got {cfg.label_smoothing}")
@@ -332,10 +353,12 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             raise ValueError(f"max_grad_norm must be >= 0, got {cfg.max_grad_norm}")
         if cfg.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {cfg.warmup_steps}")
+
         self._build_label_mapping(train_df[cfg.label_column].tolist())
 
         if BertTokenizer is None or BertForSequenceClassification is None:
             raise RuntimeError("Transformers runtime is unavailable.")
+
         tokenizer_cls = BertTokenizer
         model_cls = BertForSequenceClassification
 
@@ -417,20 +440,22 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
 
         if AdamW is None or get_linear_schedule_with_warmup is None or torch is None:
             raise RuntimeError("Torch optimizer/scheduler runtime is unavailable.")
-        optimizer_cls = AdamW
-        scheduler_factory = get_linear_schedule_with_warmup
-
         if self.model is None:
             raise RuntimeError("Model init failed.")
+
         model = self.model
         if not callable(model):
             raise RuntimeError("Model is not callable.")
 
-        optimizer = optimizer_cls(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+        optimizer = AdamW(
+            model.parameters(),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+        )
         total_steps = len(train_loader) * cfg.epochs
         warmup_steps = cfg.warmup_steps if cfg.warmup_steps > 0 else int(total_steps * cfg.warmup_ratio)
         warmup_steps = min(warmup_steps, total_steps)
-        scheduler = scheduler_factory(
+        scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=total_steps,
@@ -479,6 +504,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             train_accuracy = accuracy_score(train_labels, train_preds) if train_labels else 0.0
             val_metrics = self._evaluate_loader(val_loader)
             current_lr = float(optimizer.param_groups[0]["lr"])
+
             epoch_record = {
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
@@ -491,6 +517,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
                 "learning_rate": current_lr,
             }
             history.append(epoch_record)
+
             logger.info(
                 "Epoch %d/%d | train_loss=%.6f | val_loss=%.6f | train_accuracy=%.6f | val_accuracy=%.6f | lr=%.10f",
                 epoch + 1,
@@ -505,7 +532,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             current_val_loss = float(val_metrics["loss"])
             if current_val_loss < (best_val_loss - cfg.early_stopping_min_delta):
                 best_val_loss = current_val_loss
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 no_improve_epochs = 0
             else:
                 no_improve_epochs += 1
@@ -548,7 +575,12 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             "labels": sorted(self.label2id.keys()),
         }
 
-    def save_artifacts(self, output_dir: str, training_summary: Dict[str, Any], test_summary: Dict[str, Any]) -> Path:
+    def save_artifacts(
+        self,
+        output_dir: str,
+        training_summary: Dict[str, Any],
+        test_summary: Dict[str, Any],
+    ) -> Path:
         cfg = self.config
         save_dir = Path(output_dir) / cfg.model_output_name
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -609,12 +641,21 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         logger.info("Model artifacts saved to: %s", save_dir)
         return save_dir
 
-    def save_model(self, output_dir: str, training_summary: Dict[str, Any], test_summary: Dict[str, Any]) -> Path:
+    def save_model(
+        self,
+        output_dir: str,
+        training_summary: Dict[str, Any],
+        test_summary: Dict[str, Any],
+    ) -> Path:
         """Backward-compatible save entry for training module."""
         return self.save_artifacts(output_dir, training_summary, test_summary)
 
 
-def run_training_pipeline(df: pd.DataFrame, output_dir: str = DEFAULT_MODEL_OUTPUT_DIR, config: Optional[TrainConfig] = None) -> Dict[str, Any]:
+def run_training_pipeline(
+    df: pd.DataFrame,
+    output_dir: str = DEFAULT_MODEL_OUTPUT_DIR,
+    config: Optional[TrainConfig] = None,
+) -> Dict[str, Any]:
     """One-call API: clean -> split -> train -> evaluate -> save sentiment_train."""
     trainer = SentimentTrainer(config=config)
     clean_df = trainer.load_and_clean_data(df)
@@ -643,7 +684,7 @@ def train(config_path: Path, resume_from: Optional[Path] = None) -> TrainResult:
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    cfg_fields = {k: v for k, v in config_payload.items() if k in TrainConfig.__dataclass_fields__}
+    cfg_fields = {key: value for key, value in config_payload.items() if key in TrainConfig.__dataclass_fields__}
     cfg = TrainConfig(**cfg_fields)
 
     if resume_from is not None:

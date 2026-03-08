@@ -20,10 +20,12 @@ from transformers import (
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
+
 from classifier import ContentClassifier
 from utils.logger import setup_logger
 
-logger = setup_logger(__name__, '../../logs/classifier_train.log')
+logger = setup_logger(__name__, "../../logs/classifier_train.log")
+
 
 @dataclass
 class TransformerTrainingConfig:
@@ -108,14 +110,16 @@ class TransformerTrainer:
         self.label2id = label2id
         self.id2label = {idx: label for label, idx in label2id.items()}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.pretrained_model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             config.pretrained_model_name,
             num_labels=len(label2id),
-            id2label={int(k): v for k, v in self.id2label.items()},
+            id2label={int(key): value for key, value in self.id2label.items()},
             label2id=label2id,
         )
         self.model.to(self.device)
+
         self.data_collator = DataCollatorWithPadding(
             tokenizer=self.tokenizer,
             pad_to_multiple_of=8 if self.device.type == "cuda" else None,
@@ -123,9 +127,9 @@ class TransformerTrainer:
         self.use_amp = self.device.type == "cuda" and config.use_fp16
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        logger.info(f"训练设备: {self.device}")
-        logger.info(f"预训练模型: {config.pretrained_model_name}")
-        logger.info(f"AMP 混合精度: {'开启' if self.use_amp else '关闭'}")
+        logger.info("训练设备: %s", self.device)
+        logger.info("预训练模型: %s", config.pretrained_model_name)
+        logger.info("AMP 混合精度: %s", "开启" if self.use_amp else "关闭")
 
     def create_dataloader(
         self,
@@ -146,7 +150,7 @@ class TransformerTrainer:
             shuffle=shuffle,
             num_workers=self.config.num_workers,
             collate_fn=self.data_collator,
-            pin_memory=self.device.type == "cuda",
+            pin_memory=(self.device.type == "cuda"),
         )
 
     def train(
@@ -179,8 +183,7 @@ class TransformerTrainer:
 
         total_train_steps = max(
             1,
-            (len(train_loader) * self.config.num_epochs)
-            // self.config.gradient_accumulation_steps,
+            (len(train_loader) * self.config.num_epochs) // self.config.gradient_accumulation_steps,
         )
         warmup_steps = int(total_train_steps * self.config.warmup_ratio)
 
@@ -197,15 +200,15 @@ class TransformerTrainer:
 
         best_val_loss = float("inf")
         best_val_accuracy = 0.0
-        best_metrics = {}
+        best_metrics: Dict[str, float] = {}
         best_state_dict = None
         epochs_without_improvement = 0
 
         logger.info("开始 Transformer 训练")
-        logger.info(f"训练样本数: {len(train_data)}")
-        logger.info(f"验证样本数: {len(val_data)}")
-        logger.info(f"训练步数: {total_train_steps}")
-        logger.info(f"Warmup 步数: {warmup_steps}")
+        logger.info("训练样本数: %d", len(train_data))
+        logger.info("验证样本数: %d", len(val_data))
+        logger.info("训练步数: %d", total_train_steps)
+        logger.info("Warmup 步数: %d", warmup_steps)
         logger.info(
             "早停配置: monitor=%s, patience=%d, mode=%s, restore_best_weights=%s, min_delta=%.6f",
             self.config.monitor,
@@ -221,7 +224,7 @@ class TransformerTrainer:
             running_loss = 0.0
 
             for step, batch in enumerate(train_loader, start=1):
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {key: value.to(self.device) for key, value in batch.items()}
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     outputs = self.model(**batch)
@@ -268,11 +271,7 @@ class TransformerTrainer:
                     for key, value in self.model.state_dict().items()
                 }
                 epochs_without_improvement = 0
-                logger.info(
-                    "val_loss improved to %.4f at epoch %d",
-                    best_val_loss,
-                    epoch + 1,
-                )
+                logger.info("val_loss improved to %.4f at epoch %d", best_val_loss, epoch + 1)
             else:
                 epochs_without_improvement += 1
                 logger.info(
@@ -305,11 +304,11 @@ class TransformerTrainer:
     def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
         self.model.eval()
         total_loss = 0.0
-        predictions = []
-        references = []
+        predictions: List[int] = []
+        references: List[int] = []
 
         for batch in dataloader:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            batch = {key: value.to(self.device) for key, value in batch.items()}
             outputs = self.model(**batch)
             total_loss += outputs.loss.item()
 
@@ -332,11 +331,11 @@ class TransformerTrainer:
         )
 
         self.model.eval()
-        all_labels = []
-        all_confidences = []
+        all_labels: List[str] = []
+        all_confidences: List[float] = []
 
         for batch in dataloader:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            batch = {key: value.to(self.device) for key, value in batch.items()}
             outputs = self.model(**batch)
             probs = torch.softmax(outputs.logits, dim=-1)
             confidence, pred_ids = torch.max(probs, dim=-1)
@@ -357,12 +356,17 @@ class TransformerTrainer:
             json.dump(self.label2id, f, ensure_ascii=False, indent=2)
 
         with open(output_path / "id2label.json", "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self.id2label.items()}, f, ensure_ascii=False, indent=2)
+            json.dump(
+                {str(key): value for key, value in self.id2label.items()},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
         with open(output_path / "training_config.json", "w", encoding="utf-8") as f:
             json.dump(asdict(self.config), f, ensure_ascii=False, indent=2)
 
-        logger.info(f"Transformer 模型已保存到: {output_path}")
+        logger.info("Transformer 模型已保存到: %s", output_path)
 
 
 def set_seed(seed: int) -> None:
@@ -384,55 +388,55 @@ def step1_load_and_inspect(data_path):
     logger.info("步骤1：加载并检查数据")
 
     try:
-        with open(data_path, 'r', encoding='utf-8') as f:
+        with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         if not isinstance(data, list):
             logger.error("数据格式错误：根节点必须为列表")
             sys.exit(1)
 
-        logger.info(f"加载数据成功: {data_path}")
-        logger.info(f"总数据量: {len(data)} 条")
+        logger.info("加载数据成功: %s", data_path)
+        logger.info("总数据量: %d 条", len(data))
 
         if data:
             logger.info("数据结构示例（第1条）:")
             first_item = data[0]
             if isinstance(first_item, dict):
                 for key, value in first_item.items():
-                    logger.info(f"  {key}: {value}")
+                    logger.info("  %s: %s", key, value)
             else:
-                logger.warning(f"第1条数据不是对象类型: {type(first_item)}")
+                logger.warning("第1条数据不是对象类型: %s", type(first_item))
 
         logger.info("开始检查数据完整性...")
         missing_count = 0
-        for i, item in enumerate(data):
+        for index, item in enumerate(data):
             if not isinstance(item, dict):
-                logger.warning(f"第{i + 1}条数据不是对象类型")
+                logger.warning("第%d条数据不是对象类型", index + 1)
                 missing_count += 1
                 continue
 
-            if 'input' not in item or 'label' not in item:
-                logger.warning(f"第{i + 1}条数据缺失字段")
+            if "input" not in item or "label" not in item:
+                logger.warning("第%d条数据缺失字段", index + 1)
                 missing_count += 1
-            elif not item.get('input') or not item.get('label'):
-                logger.warning(f"第{i + 1}条数据字段为空")
+            elif not item.get("input") or not item.get("label"):
+                logger.warning("第%d条数据字段为空", index + 1)
                 missing_count += 1
 
         if missing_count == 0:
             logger.info("所有数据字段完整")
         else:
-            logger.warning(f"发现 {missing_count} 条数据有问题")
+            logger.warning("发现 %d 条数据有问题", missing_count)
 
         return data
 
     except FileNotFoundError:
-        logger.error(f"文件不存在: {data_path}")
+        logger.error("文件不存在: %s", data_path)
         sys.exit(1)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析失败: {e}")
+        logger.error("JSON 解析失败: %s", e)
         sys.exit(1)
     except Exception as e:
-        logger.exception(f"加载数据失败: {e}")
+        logger.exception("加载数据失败: %s", e)
         sys.exit(1)
 
 
@@ -440,7 +444,7 @@ def step2_check_text_length(data):
     logger.info("步骤2：检查文本长度")
 
     try:
-        texts = [item.get('input', '') for item in data]
+        texts = [item.get("input", "") for item in data]
         lengths = [len(text) for text in texts]
 
         if not lengths:
@@ -452,30 +456,36 @@ def step2_check_text_length(data):
         max_length = max(lengths)
 
         logger.info("文本长度统计:")
-        logger.info(f"  平均长度: {avg_length:.1f} 字符")
-        logger.info(f"  最短: {min_length} 字符")
-        logger.info(f"  最长: {max_length} 字符")
+        logger.info("  平均长度: %.1f 字符", avg_length)
+        logger.info("  最短: %d 字符", min_length)
+        logger.info("  最长: %d 字符", max_length)
 
-        short_texts = [(i, text) for i, text in enumerate(texts) if len(text) < 3]
+        short_texts = [(index, text) for index, text in enumerate(texts) if len(text) < 3]
 
         if short_texts:
-            logger.warning(f"发现 {len(short_texts)} 条过短文本（<3字符）")
-            for i, text in short_texts[:5]:
-                logger.info(f"  [{i + 1}] '{text}'")
+            logger.warning("发现 %d 条过短文本（<3字符）", len(short_texts))
+            for index, text in short_texts[:5]:
+                logger.info("  [%d] '%s'", index + 1, text)
             if len(short_texts) > 5:
-                logger.info(f"  ... 还有 {len(short_texts) - 5} 条")
+                logger.info("  ... 还有 %d 条", len(short_texts) - 5)
         else:
             logger.info("没有发现过短文本")
 
         logger.info("长度分布:")
-        ranges = [(0, 10), (10, 50), (50, 100), (100, 500), (500, float('inf'))]
+        ranges = [(0, 10), (10, 50), (50, 100), (100, 500), (500, float("inf"))]
         for start, end in ranges:
-            count = sum(1 for l in lengths if start <= l < end)
+            count = sum(1 for length in lengths if start <= length < end)
             percentage = count / len(lengths) * 100
-            logger.info(f"  {start}-{end if end != float('inf') else '∞'} 字符: {count} 条 ({percentage:.1f}%)")
+            logger.info(
+                "  %s-%s 字符: %d 条 (%.1f%%)",
+                start,
+                end if end != float("inf") else "∞",
+                count,
+                percentage,
+            )
 
     except Exception as e:
-        logger.exception(f"检查文本长度时发生错误: {e}")
+        logger.exception("检查文本长度时发生错误: %s", e)
 
     return data
 
@@ -484,10 +494,10 @@ def step3_check_duplicates(data):
     logger.info("步骤3：检查重复数据")
 
     try:
-        text_counts = {}
+        text_counts: Dict[str, int] = {}
 
         for item in data:
-            text = item.get('input', '')
+            text = item.get("input", "")
             if text in text_counts:
                 text_counts[text] += 1
             else:
@@ -501,19 +511,19 @@ def step3_check_duplicates(data):
 
         if duplicates:
             logger.warning("发现重复数据")
-            logger.info(f"  总数据量: {total_texts} 条")
-            logger.info(f"  唯一文本: {unique_texts} 条")
-            logger.info(f"  重复率: {duplicate_rate:.2f}%")
+            logger.info("  总数据量: %d 条", total_texts)
+            logger.info("  唯一文本: %d 条", unique_texts)
+            logger.info("  重复率: %.2f%%", duplicate_rate)
 
             logger.info("重复最多的文本（前5个）:")
-            sorted_dups = sorted(duplicates.items(), key=lambda x: x[1], reverse=True)
-            for text, count in sorted_dups[:5]:
-                logger.info(f"  出现{count}次: '{text[:50]}...'")
+            sorted_duplicates = sorted(duplicates.items(), key=lambda item: item[1], reverse=True)
+            for text, count in sorted_duplicates[:5]:
+                logger.info("  出现%d次: '%s...'", count, text[:50])
         else:
             logger.info("没有发现重复数据")
 
     except Exception as e:
-        logger.exception(f"检查重复数据时发生错误: {e}")
+        logger.exception("检查重复数据时发生错误: %s", e)
 
     return data
 
@@ -522,7 +532,7 @@ def step4_check_label_distribution(data):
     logger.info("步骤4：检查标签分布")
 
     try:
-        labels = [item.get('label', '') for item in data]
+        labels = [item.get("label", "") for item in data]
         label_counts = Counter(labels)
 
         if not labels:
@@ -534,16 +544,16 @@ def step4_check_label_distribution(data):
         for label, count in sorted(label_counts.items()):
             percentage = count / total * 100
             bar = "█" * int(percentage / 2)
-            logger.info(f"  {label:15s}: {count:5d} ({percentage:5.1f}%) {bar}")
+            logger.info("  %-15s: %5d (%5.1f%%) %s", label, count, percentage, bar)
 
         min_count = min(label_counts.values())
         max_count = max(label_counts.values())
         balance_ratio = min_count / max_count if max_count else 0.0
 
         logger.info("平衡度分析:")
-        logger.info(f"  最少类别: {min_count} 条")
-        logger.info(f"  最多类别: {max_count} 条")
-        logger.info(f"  平衡比例: {balance_ratio:.2f}")
+        logger.info("  最少类别: %d 条", min_count)
+        logger.info("  最多类别: %d 条", max_count)
+        logger.info("  平衡比例: %.2f", balance_ratio)
 
         if balance_ratio >= 0.8:
             logger.info("数据较为平衡")
@@ -553,7 +563,7 @@ def step4_check_label_distribution(data):
             logger.warning("数据严重不平衡，必须进行平衡处理")
 
     except Exception as e:
-        logger.exception(f"检查标签分布时发生错误: {e}")
+        logger.exception("检查标签分布时发生错误: %s", e)
 
     return data
 
@@ -562,10 +572,10 @@ def step5_check_label_consistency(data):
     logger.info("步骤5：检查标签一致性")
 
     try:
-        text_labels = {}
+        text_labels: Dict[str, List[str]] = {}
         for item in data:
-            text = item.get('input', '')
-            label = item.get('label', '')
+            text = item.get("input", "")
+            label = item.get("label", "")
 
             if text not in text_labels:
                 text_labels[text] = []
@@ -575,34 +585,36 @@ def step5_check_label_consistency(data):
         for text, labels in text_labels.items():
             unique_labels = set(labels)
             if len(unique_labels) > 1:
-                conflicts.append({
-                    'text': text,
-                    'labels': list(unique_labels),
-                    'counts': Counter(labels)
-                })
+                conflicts.append(
+                    {
+                        "text": text,
+                        "labels": list(unique_labels),
+                        "counts": Counter(labels),
+                    }
+                )
 
         if conflicts:
-            logger.warning(f"发现 {len(conflicts)} 条文本标签不一致")
-            for i, conflict in enumerate(conflicts[:5], 1):
-                logger.warning(f"  [{i}] 文本: '{conflict['text'][:50]}...'")
-                logger.warning(f"      标签: {conflict['labels']}")
-                logger.warning(f"      分布: {dict(conflict['counts'])}")
+            logger.warning("发现 %d 条文本标签不一致", len(conflicts))
+            for index, conflict in enumerate(conflicts[:5], start=1):
+                logger.warning("  [%d] 文本: '%s...'", index, conflict["text"][:50])
+                logger.warning("      标签: %s", conflict["labels"])
+                logger.warning("      分布: %s", dict(conflict["counts"]))
 
             if len(conflicts) > 5:
-                logger.warning(f"  ... 还有 {len(conflicts) - 5} 条冲突")
+                logger.warning("  ... 还有 %d 条冲突", len(conflicts) - 5)
 
             logger.warning("建议：人工检查这些样本，统一标签")
         else:
             logger.info("所有文本标签一致")
 
     except Exception as e:
-        logger.exception(f"检查标签一致性时发生错误: {e}")
+        logger.exception("检查标签一致性时发生错误: %s", e)
 
     return data
 
 
 def step6_remove_short_texts(data, min_length=3):
-    logger.info(f"步骤6：移除短于{min_length}字符的文本")
+    logger.info("步骤6：移除短于%d字符的文本", min_length)
 
     try:
         original_count = len(data)
@@ -611,7 +623,7 @@ def step6_remove_short_texts(data, min_length=3):
         removed_texts = []
 
         for item in data:
-            text = item.get('input', '')
+            text = item.get("input", "")
             if len(text) >= min_length:
                 filtered_data.append(item)
             else:
@@ -620,19 +632,19 @@ def step6_remove_short_texts(data, min_length=3):
         removed_count = original_count - len(filtered_data)
         removed_ratio = (removed_count / original_count * 100) if original_count else 0.0
 
-        logger.info(f"原始数据: {original_count} 条")
-        logger.info(f"过滤后: {len(filtered_data)} 条")
-        logger.info(f"移除: {removed_count} 条 ({removed_ratio:.1f}%)")
+        logger.info("原始数据: %d 条", original_count)
+        logger.info("过滤后: %d 条", len(filtered_data))
+        logger.info("移除: %d 条 (%.1f%%)", removed_count, removed_ratio)
 
         if removed_texts:
             logger.info("移除的文本示例（前5个）:")
             for text in removed_texts[:5]:
-                logger.info(f"  '{text}'")
+                logger.info("  '%s'", text)
 
         return filtered_data
 
     except Exception as e:
-        logger.exception(f"移除短文本时发生错误: {e}")
+        logger.exception("移除短文本时发生错误: %s", e)
         return data
 
 
@@ -642,11 +654,11 @@ def step7_remove_duplicates(data):
     try:
         original_count = len(data)
 
-        seen_texts = {}
+        seen_texts: Dict[str, bool] = {}
         dedup_data = []
 
         for item in data:
-            text = item.get('input', '')
+            text = item.get("input", "")
             if text not in seen_texts:
                 seen_texts[text] = True
                 dedup_data.append(item)
@@ -654,73 +666,74 @@ def step7_remove_duplicates(data):
         removed_count = original_count - len(dedup_data)
         removed_ratio = (removed_count / original_count * 100) if original_count else 0.0
 
-        logger.info(f"原始数据: {original_count} 条")
-        logger.info(f"去重后: {len(dedup_data)} 条")
-        logger.info(f"移除: {removed_count} 条 ({removed_ratio:.1f}%)")
+        logger.info("原始数据: %d 条", original_count)
+        logger.info("去重后: %d 条", len(dedup_data))
+        logger.info("移除: %d 条 (%.1f%%)", removed_count, removed_ratio)
 
         return dedup_data
 
     except Exception as e:
-        logger.exception(f"移除重复数据时发生错误: {e}")
+        logger.exception("移除重复数据时发生错误: %s", e)
         return data
 
 
-def step8_balance_data(data, strategy='downsample'):
-    logger.info(f"步骤8：平衡数据（策略：{strategy}）")
+def step8_balance_data(data, strategy="downsample"):
+    logger.info("步骤8：平衡数据（策略：%s）", strategy)
 
     try:
-        label_groups = {}
+        label_groups: Dict[str, List[Dict[str, str]]] = {}
         for item in data:
-            label = item.get('label', '')
+            label = item.get("label", "")
             if label not in label_groups:
                 label_groups[label] = []
             label_groups[label].append(item)
 
         logger.info("原始分布:")
         for label, items in sorted(label_groups.items()):
-            logger.info(f"  {label}: {len(items)} 条")
+            logger.info("  %s: %d 条", label, len(items))
 
         if not label_groups:
             return data
 
-        if strategy == 'downsample':
+        if strategy == "downsample":
             min_count = min(len(items) for items in label_groups.values())
-            logger.info(f"下采样目标: 每类 {min_count} 条")
+            logger.info("下采样目标: 每类 %d 条", min_count)
 
             balanced_data = []
-            for label, items in label_groups.items():
+            for _, items in label_groups.items():
                 random.shuffle(items)
                 balanced_data.extend(items[:min_count])
 
-        elif strategy == 'upsample':
+        elif strategy == "upsample":
             max_count = max(len(items) for items in label_groups.values())
-            logger.info(f"上采样目标: 每类 {max_count} 条")
+            logger.info("上采样目标: 每类 %d 条", max_count)
 
             balanced_data = []
-            for label, items in label_groups.items():
+            for _, items in label_groups.items():
                 sampled_items = items.copy()
                 while len(sampled_items) < max_count:
-                    sampled_items.extend(random.sample(items, min(len(items), max_count - len(sampled_items))))
+                    sampled_items.extend(
+                        random.sample(items, min(len(items), max_count - len(sampled_items)))
+                    )
                 balanced_data.extend(sampled_items[:max_count])
         else:
-            logger.warning(f"未知平衡策略: {strategy}，跳过平衡")
+            logger.warning("未知平衡策略: %s，跳过平衡", strategy)
             return data
 
         logger.info("平衡后分布:")
-        balanced_labels = Counter(item.get('label', '') for item in balanced_data)
+        balanced_labels = Counter(item.get("label", "") for item in balanced_data)
         for label, count in sorted(balanced_labels.items()):
-            logger.info(f"  {label}: {count} 条")
+            logger.info("  %s: %d 条", label, count)
 
-        logger.info(f"总数据量: {len(data)} → {len(balanced_data)}")
-
+        logger.info("总数据量: %d → %d", len(data), len(balanced_data))
         return balanced_data
 
     except Exception as e:
-        logger.exception(f"平衡数据时发生错误: {e}")
+        logger.exception("平衡数据时发生错误: %s", e)
         return data
 
 
-def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'):
+def load_and_prepare_data(data_path, min_length=3, balance_strategy="downsample"):
     """
     加载并准备训练数据（使用现有清洗流程）
 
@@ -749,14 +762,14 @@ def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'
             if not isinstance(item, dict):
                 continue
 
-            raw_text = item.get('input', '')
-            raw_label = item.get('label', '')
-            text = str(raw_text).strip() if raw_text is not None else ''
-            label = str(raw_label).strip() if raw_label is not None else ''
+            raw_text = item.get("input", "")
+            raw_label = item.get("label", "")
+            text = str(raw_text).strip() if raw_text is not None else ""
+            label = str(raw_label).strip() if raw_label is not None else ""
             if text and label:
-                formatted_data.append({'input': text, 'label': label})
+                formatted_data.append({"input": text, "label": label})
 
-        logger.info(f"格式化后数据: {len(formatted_data)} 条")
+        logger.info("格式化后数据: %d 条", len(formatted_data))
 
         cleaned_data = step6_remove_short_texts(formatted_data, min_length=min_length)
         cleaned_data = step7_remove_duplicates(cleaned_data)
@@ -764,17 +777,19 @@ def load_and_prepare_data(data_path, min_length=3, balance_strategy='downsample'
 
         final_data = []
         for item in cleaned_data:
-            final_data.append({
-                'text': item['input'],
-                'label': item['label']
-            })
+            final_data.append(
+                {
+                    "text": item["input"],
+                    "label": item["label"],
+                }
+            )
 
         if not final_data:
             logger.error("清洗后数据为空，无法继续训练")
             sys.exit(1)
 
         logger.info("=" * 60)
-        logger.info(f"数据清洗完成，最终数据量: {len(final_data)} 条")
+        logger.info("数据清洗完成，最终数据量: %d 条", len(final_data))
         logger.info("=" * 60)
 
         return final_data
@@ -790,7 +805,7 @@ def create_stratified_splits(
     val_size: float = 0.1,
     random_seed: int = 42,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
-    logger.info(f"划分数据集（test_size={test_size}, val_size={val_size}）")
+    logger.info("划分数据集（test_size=%s, val_size=%s）", test_size, val_size)
 
     try:
         if not data:
@@ -802,8 +817,8 @@ def create_stratified_splits(
         if test_size + val_size >= 1:
             raise ValueError("test_size + val_size 必须小于 1")
 
-        texts = [item['text'] for item in data]
-        labels = [item['label'] for item in data]
+        texts = [item["text"] for item in data]
+        labels = [item["label"] for item in data]
         label_counts = Counter(labels)
         min_label_count = min(label_counts.values()) if label_counts else 0
 
@@ -833,16 +848,16 @@ def create_stratified_splits(
             stratify=train_val_labels if use_val_stratify else None,
         )
 
-        train_data = [{'text': text, 'label': label} for text, label in zip(train_texts, train_labels)]
-        val_data = [{'text': text, 'label': label} for text, label in zip(val_texts, val_labels)]
-        test_data = [{'text': text, 'label': label} for text, label in zip(test_texts, test_labels)]
+        train_data = [{"text": text, "label": label} for text, label in zip(train_texts, train_labels)]
+        val_data = [{"text": text, "label": label} for text, label in zip(val_texts, val_labels)]
+        test_data = [{"text": text, "label": label} for text, label in zip(test_texts, test_labels)]
 
         if not train_data or not val_data or not test_data:
             raise ValueError("训练/验证/测试集存在空集，无法继续训练")
 
-        logger.info(f"训练集: {len(train_data)} 条")
-        logger.info(f"验证集: {len(val_data)} 条")
-        logger.info(f"测试集: {len(test_data)} 条")
+        logger.info("训练集: %d 条", len(train_data))
+        logger.info("验证集: %d 条", len(val_data))
+        logger.info("测试集: %d 条", len(test_data))
 
         return train_data, val_data, test_data
 
@@ -852,12 +867,13 @@ def create_stratified_splits(
 
 
 def build_label_mappings(data: List[Dict[str, str]]) -> Tuple[Dict[str, int], Dict[int, str]]:
-    labels = sorted({item['label'] for item in data if item.get('label')})
+    labels = sorted({item["label"] for item in data if item.get("label")})
     if not labels:
         raise ValueError("未找到有效标签，无法构建标签映射")
+
     label2id = {label: idx for idx, label in enumerate(labels)}
     id2label = {idx: label for label, idx in label2id.items()}
-    logger.info(f"标签映射: {label2id}")
+    logger.info("标签映射: %s", label2id)
     return label2id, id2label
 
 
@@ -887,7 +903,6 @@ def train_transformer_model(
             max_length=config.max_length,
             inference_batch_size=config.eval_batch_size,
         )
-
         return classifier, train_metrics
 
     except Exception:
@@ -906,8 +921,8 @@ def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str
             logger.error("测试集为空，无法评估")
             sys.exit(1)
 
-        test_texts = [item['text'] for item in test_data]
-        test_labels = [item['label'] for item in test_data]
+        test_texts = [item["text"] for item in test_data]
+        test_labels = [item["label"] for item in test_data]
 
         predictions, confidences = classifier.predict_texts(
             test_texts,
@@ -916,41 +931,51 @@ def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str
         )
         test_acc = accuracy_score(test_labels, predictions)
 
-        logger.info(f"测试准确率: {test_acc:.4f}")
+        logger.info("测试准确率: %.4f", test_acc)
         if confidences:
-            logger.info(f"平均置信度: {float(np.mean(confidences)):.4f}")
+            logger.info("平均置信度: %.4f", float(np.mean(confidences)))
 
         logger.info("详细分类报告:")
         report = classification_report(test_labels, predictions, digits=4)
-        for line in report.split('\n'):
+        for line in report.split("\n"):
             if line.strip():
-                logger.info(f"  {line}")
+                logger.info("  %s", line)
 
         errors = []
-        for true, pred, text, conf in zip(test_labels, predictions, test_texts, confidences):
-            if true != pred:
-                errors.append({
-                    'text': text,
-                    'true': true,
-                    'pred': pred,
-                    'confidence': conf,
-                })
+        for true_label, pred_label, text, confidence in zip(
+            test_labels,
+            predictions,
+            test_texts,
+            confidences,
+        ):
+            if true_label != pred_label:
+                errors.append(
+                    {
+                        "text": text,
+                        "true": true_label,
+                        "pred": pred_label,
+                        "confidence": confidence,
+                    }
+                )
 
         error_rate = len(errors) / len(test_labels) * 100 if test_labels else 0.0
-        logger.info(f"错误样本数: {len(errors)}/{len(test_labels)} ({error_rate:.2f}%)")
+        logger.info("错误样本数: %d/%d (%.2f%%)", len(errors), len(test_labels), error_rate)
 
         if errors:
             logger.info("前10个错误样本:")
-            for i, err in enumerate(errors[:10], 1):
-                logger.info(f"  [{i}] 文本: {err['text'][:60]}...")
+            for index, err in enumerate(errors[:10], start=1):
+                logger.info("  [%d] 文本: %s...", index, err["text"][:60])
                 logger.info(
-                    f"      真实: {err['true']} | 预测: {err['pred']} | 置信度: {err['confidence']:.4f}"
+                    "      真实: %s | 预测: %s | 置信度: %.4f",
+                    err["true"],
+                    err["pred"],
+                    err["confidence"],
                 )
 
         return {
-            'accuracy': test_acc,
-            'errors': errors,
-            'report': report,
+            "accuracy": test_acc,
+            "errors": errors,
+            "report": report,
         }
 
     except Exception:
@@ -966,9 +991,8 @@ def main():
             sys.exit(1)
 
         data_path = sys.argv[1]
-
         if not Path(data_path).exists():
-            logger.error(f"数据文件不存在: {data_path}")
+            logger.error("数据文件不存在: %s", data_path)
             sys.exit(1)
 
         config = TransformerTrainingConfig()
@@ -977,7 +1001,7 @@ def main():
         logger.info("=" * 60)
         logger.info("Transformer 文本分类训练 - 基于 xlm-roberta-large")
         logger.info("=" * 60)
-        logger.info(f"训练配置: {asdict(config)}")
+        logger.info("训练配置: %s", asdict(config))
 
         logger.info("步骤 1: 完整数据清洗")
         clean_data = load_and_prepare_data(
@@ -1007,23 +1031,23 @@ def main():
         logger.info("=" * 60)
         logger.info("训练总结")
         logger.info("=" * 60)
-        logger.info(f"训练损失: {train_metrics.get('train_loss', 0.0):.4f}")
-        logger.info(f"验证损失: {train_metrics.get('val_loss', 0.0):.4f}")
-        logger.info(f"验证准确率: {train_metrics.get('val_accuracy', 0.0):.4f}")
-        logger.info(f"测试集准确率: {test_results['accuracy']:.4f}")
-        logger.info(f"模型目录: {config.output_dir}")
+        logger.info("训练损失: %.4f", train_metrics.get("train_loss", 0.0))
+        logger.info("验证损失: %.4f", train_metrics.get("val_loss", 0.0))
+        logger.info("验证准确率: %.4f", train_metrics.get("val_accuracy", 0.0))
+        logger.info("测试集准确率: %.4f", test_results["accuracy"])
+        logger.info("模型目录: %s", config.output_dir)
         logger.info("=" * 60)
 
-        if test_results['accuracy'] >= 0.98:
+        if test_results["accuracy"] >= 0.98:
             logger.info("恭喜！模型准确率达到98%以上！")
-        elif test_results['accuracy'] >= 0.95:
+        elif test_results["accuracy"] >= 0.95:
             logger.info("模型表现良好，准确率超过95%")
             logger.info("改进建议:")
             logger.info("  1. 增加更多训练数据")
             logger.info("  2. 分析错误样本，优化标注质量")
             logger.info("  3. 适当增大 max_length 或训练轮次")
         else:
-            logger.info(f"当前准确率: {test_results['accuracy']:.2%}")
+            logger.info("当前准确率: %.2f%%", test_results["accuracy"] * 100)
             logger.info("改进建议:")
             logger.info("  1. 检查数据质量和标注一致性")
             logger.info("  2. 增加更多训练数据")
