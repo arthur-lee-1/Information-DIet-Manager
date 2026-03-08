@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""
+情感训练模块。
+
+职责：
+    封装基于 BERT 的情感分类训练、验证、测试评估与模型产物保存流程。
+
+特点：
+    - 提供从清洗数据到保存模型的一站式训练管线；
+    - 支持在线加载与本地离线回退；
+    - 兼容 sentiment.py 的旧版推理加载方式。
+"""
+
 import json
 import os
 import pickle
@@ -34,7 +46,7 @@ from sklearn.model_selection import train_test_split
 
 from utils.logger import setup_logger
 
-# Keep mirror endpoint for regions with limited HF connectivity
+# 为 HuggingFace 下载配置镜像，便于网络受限环境下拉取模型
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 try:
@@ -68,6 +80,7 @@ DEFAULT_TRAIN_VIS_DIRNAME = "train_vis"
 
 @dataclass
 class TrainResult:
+    """训练流程的统一返回结构。"""
     model_name: str
     save_dir: str
     train_summary: Dict[str, Any]
@@ -76,6 +89,7 @@ class TrainResult:
 
 @dataclass
 class TrainConfig:
+    """训练配置，集中管理数据列、超参数与输出目录命名。"""
     text_column: str = "text"
     label_column: str = "sentiment"
     test_size: float = 0.15
@@ -99,6 +113,7 @@ class TrainConfig:
 
 
 class SentimentTrainDataset(Dataset):
+    """将文本与标签包装为适配 PyTorch DataLoader 的数据集。"""
     def __init__(
         self,
         texts: List[str],
@@ -135,18 +150,21 @@ class SentimentTrainDataset(Dataset):
 
 
 class BaseTrainer(ABC):
+    """训练器抽象基类。"""
     @abstractmethod
     def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> Dict[str, Any]:
         raise NotImplementedError
 
 
 class BasePredictor(ABC):
+    """评估器抽象基类。"""
     @abstractmethod
     def evaluate_test(self, test_df: pd.DataFrame) -> Dict[str, Any]:
         raise NotImplementedError
 
 
 class SentimentTrainer(BaseTrainer, BasePredictor):
+    """BERT 情感分类训练器，负责完整训练生命周期管理。"""
     def __init__(self, config: Optional[TrainConfig] = None):
         if not BERT_AVAILABLE:
             raise ImportError("BERT dependencies unavailable. Install torch and transformers.")
@@ -173,9 +191,11 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
+            # 同步设置所有 CUDA 设备随机种子，提升实验可复现性。
             torch.cuda.manual_seed_all(seed)
 
     def load_and_clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """清洗原始训练数据，保留有效文本与标签并去重。"""
         cfg = self.config
         required = {cfg.text_column, cfg.label_column}
         missing = [column for column in required if column not in data.columns]
@@ -197,6 +217,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         return df
 
     def split_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """按配置将数据稳定拆分为训练、验证和测试集合。"""
         cfg = self.config
         train_df, temp_df = train_test_split(
             df,
@@ -217,11 +238,13 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         return train_df, val_df, test_df
 
     def _build_label_mapping(self, labels: List[str]) -> None:
+        """建立标签到整数 ID 的双向映射。"""
         unique_labels = sorted(set(labels))
         self.label2id = {label: idx for idx, label in enumerate(unique_labels)}
         self.id2label = {idx: label for label, idx in self.label2id.items()}
 
     def _to_loader(self, df: pd.DataFrame, shuffle: bool) -> Any:
+        """将 DataFrame 转换为 DataLoader，供训练或评估阶段使用。"""
         cfg = self.config
         dataset = SentimentTrainDataset(
             texts=df[cfg.text_column].tolist(),
@@ -238,6 +261,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         )
 
     def _evaluate_loader(self, data_loader: Any) -> Dict[str, Any]:
+        """在给定数据加载器上执行前向评估并汇总核心指标。"""
         if torch is None or F is None:
             raise RuntimeError("Torch runtime is unavailable.")
         if self.model is None:
@@ -291,6 +315,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         save_dir: Path,
         history: List[Dict[str, Any]],
     ) -> Dict[str, str]:
+        """保存训练历史及可选的损失/精度曲线图。"""
         vis_dir = save_dir / DEFAULT_TRAIN_VIS_DIRNAME
         vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -454,6 +479,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         )
         total_steps = len(train_loader) * cfg.epochs
         warmup_steps = cfg.warmup_steps if cfg.warmup_steps > 0 else int(total_steps * cfg.warmup_ratio)
+        # warmup 步数支持显式指定；若未指定，则按总步数比例自动推导。
         warmup_steps = min(warmup_steps, total_steps)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
@@ -462,6 +488,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         )
 
         use_amp = self.device.type == "cuda"
+        # 仅在 CUDA 上启用混合精度，兼顾训练速度与显存占用。
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         best_val_loss = float("inf")
@@ -476,6 +503,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
             train_labels: List[int] = []
 
             for batch in train_loader:
+                # 标准训练步骤：前向、反向、梯度裁剪、优化器更新、调度器更新。
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 y = batch["label"].to(self.device)
@@ -531,6 +559,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
 
             current_val_loss = float(val_metrics["loss"])
             if current_val_loss < (best_val_loss - cfg.early_stopping_min_delta):
+                # 仅在验证损失出现有效改善时刷新最优权重。
                 best_val_loss = current_val_loss
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 no_improve_epochs = 0
@@ -547,6 +576,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
                     break
 
         if best_state is not None:
+            # 训练结束后恢复到验证集表现最好的参数，而不是最后一个 epoch。
             model.load_state_dict(best_state)
 
         return {
@@ -556,6 +586,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         }
 
     def evaluate_test(self, test_df: pd.DataFrame) -> Dict[str, Any]:
+        """在测试集上评估最终模型，并生成分类报告与混淆矩阵。"""
         test_loader = self._to_loader(test_df, shuffle=False)
         metrics = self._evaluate_loader(test_loader)
 
@@ -581,6 +612,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         training_summary: Dict[str, Any],
         test_summary: Dict[str, Any],
     ) -> Path:
+        """保存模型权重、配置、评估结果和兼容性元数据。"""
         cfg = self.config
         save_dir = Path(output_dir) / cfg.model_output_name
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -622,7 +654,7 @@ class SentimentTrainer(BaseTrainer, BasePredictor):
         with open(save_dir / "model_card.md", "w", encoding="utf-8") as f:
             f.write(model_card)
 
-        # Backward compatibility for sentiment.py loader (expects metadata.pkl)
+        # 为旧版 sentiment.py 推理加载逻辑额外写出 metadata.pkl。
         try:
             from sklearn.preprocessing import LabelEncoder
 
@@ -656,7 +688,7 @@ def run_training_pipeline(
     output_dir: str = DEFAULT_MODEL_OUTPUT_DIR,
     config: Optional[TrainConfig] = None,
 ) -> Dict[str, Any]:
-    """One-call API: clean -> split -> train -> evaluate -> save sentiment_train."""
+    """一站式训练入口：清洗、切分、训练、测试评估并保存产物。"""
     trainer = SentimentTrainer(config=config)
     clean_df = trainer.load_and_clean_data(df)
     train_df, val_df, test_df = trainer.split_data(clean_df)
@@ -675,7 +707,7 @@ def run_training_pipeline(
 
 
 def train(config_path: Path, resume_from: Optional[Path] = None) -> TrainResult:
-    """Contract API: train(config_path, resume_from) -> TrainResult."""
+    """契约式训练入口：从配置文件读取参数并返回结构化训练结果。"""
     with open(config_path, "r", encoding="utf-8") as f:
         config_payload = json.load(f)
 
@@ -699,7 +731,7 @@ def train(config_path: Path, resume_from: Optional[Path] = None) -> TrainResult:
 
 
 def finetune(base_model_path: Path, new_data_path: Path, output_dir: Path) -> Path:
-    """Contract API: finetune(base_model_path, new_data_path, output_dir) -> Path."""
+    """微调入口：以已有模型为起点，在新数据上继续训练并输出新模型。"""
     if not new_data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {new_data_path}")
 
@@ -713,7 +745,7 @@ def finetune(base_model_path: Path, new_data_path: Path, output_dir: Path) -> Pa
 
 
 if __name__ == "__main__":
-    # Minimal CLI example
+    # 最小可运行示例：读取 CSV 后直接执行完整训练流水线
     csv_path = "../training_data/converted_dataset.csv"
     if not Path(csv_path).exists():
         raise FileNotFoundError(f"Dataset not found: {csv_path}")

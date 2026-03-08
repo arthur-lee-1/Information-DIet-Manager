@@ -1,3 +1,13 @@
+"""
+文本分类训练脚本。
+
+职责：
+    提供分类训练所需的数据检查、清洗、划分、训练、评估与模型导出流程。
+
+说明：
+    该文件更偏向离线训练与实验使用，因此保留了较详细的数据质量日志，
+    便于在训练前尽早发现标注、分布和样本质量问题。
+"""
 import json
 import random
 import sys
@@ -29,6 +39,7 @@ logger = setup_logger(__name__, "../../logs/classifier_train.log")
 
 @dataclass
 class TransformerTrainingConfig:
+    """Transformer 分类训练配置。"""
     pretrained_model_name: str = "xlm-roberta-large"
     output_dir: str = str(Path(__file__).parent / "models" / "classifier_xlm_roberta")
     max_length: int = 128
@@ -54,6 +65,7 @@ class TransformerTrainingConfig:
 
 
 class TextClassificationDataset(Dataset):
+    """将原始文本与标签包装为可供 DataLoader 使用的数据集。"""
     def __init__(
         self,
         texts: List[str],
@@ -86,6 +98,11 @@ class TextClassificationDataset(Dataset):
 
 
 class TransformerTrainer:
+    """
+    Transformer 分类训练器。
+
+    负责模型初始化、数据装载、训练循环、验证评估以及最终权重导出。
+    """
     def __init__(
         self,
         label2id: Dict[str, int],
@@ -122,6 +139,7 @@ class TransformerTrainer:
 
         self.data_collator = DataCollatorWithPadding(
             tokenizer=self.tokenizer,
+            # 在 GPU 上按 8 对齐通常更利于 Tensor Core 发挥吞吐。
             pad_to_multiple_of=8 if self.device.type == "cuda" else None,
         )
         self.use_amp = self.device.type == "cuda" and config.use_fp16
@@ -183,6 +201,7 @@ class TransformerTrainer:
 
         total_train_steps = max(
             1,
+            # 配合梯度累积时，将 loss 按累积步数缩放，保持整体梯度量级稳定。
             (len(train_loader) * self.config.num_epochs) // self.config.gradient_accumulation_steps,
         )
         warmup_steps = int(total_train_steps * self.config.warmup_ratio)
@@ -266,6 +285,7 @@ class TransformerTrainer:
                     "val_accuracy": val_metrics["accuracy"],
                     "best_epoch": epoch + 1,
                 }
+                # 提前缓存最佳权重，便于早停后恢复到验证集表现最好的时刻。
                 best_state_dict = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
@@ -370,6 +390,7 @@ class TransformerTrainer:
 
 
 def set_seed(seed: int) -> None:
+    """统一设置随机种子，尽量降低训练结果的波动。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -379,11 +400,10 @@ def set_seed(seed: int) -> None:
 
 def step1_load_and_inspect(data_path):
     """
-    步骤1：加载数据并进行初步检查
+    加载原始训练数据并做基础结构检查。
 
-    学习目标：
-    - 了解数据的基本结构
-    - 发现明显的问题
+    该步骤主要用于尽早暴露文件格式、字段缺失和空值问题，
+    避免后续训练阶段才出现难以定位的异常。
     """
     logger.info("步骤1：加载并检查数据")
 
@@ -441,6 +461,7 @@ def step1_load_and_inspect(data_path):
 
 
 def step2_check_text_length(data):
+    """统计文本长度分布，用于评估截断风险与脏数据比例。"""
     logger.info("步骤2：检查文本长度")
 
     try:
@@ -491,6 +512,7 @@ def step2_check_text_length(data):
 
 
 def step3_check_duplicates(data):
+    """检查重复文本，帮助评估数据冗余和潜在泄漏风险。"""
     logger.info("步骤3：检查重复数据")
 
     try:
@@ -529,6 +551,7 @@ def step3_check_duplicates(data):
 
 
 def step4_check_label_distribution(data):
+    """统计标签分布，为后续是否做类别平衡提供依据。"""
     logger.info("步骤4：检查标签分布")
 
     try:
@@ -569,6 +592,7 @@ def step4_check_label_distribution(data):
 
 
 def step5_check_label_consistency(data):
+    """检查同一文本是否被标注为多个类别，以发现标注冲突。"""
     logger.info("步骤5：检查标签一致性")
 
     try:
@@ -614,6 +638,7 @@ def step5_check_label_consistency(data):
 
 
 def step6_remove_short_texts(data, min_length=3):
+    """移除过短文本，减少无信息样本对模型训练的干扰。"""
     logger.info("步骤6：移除短于%d字符的文本", min_length)
 
     try:
@@ -649,6 +674,7 @@ def step6_remove_short_texts(data, min_length=3):
 
 
 def step7_remove_duplicates(data):
+    """按文本去重，避免重复样本过度影响训练分布。"""
     logger.info("步骤7：移除重复数据")
 
     try:
@@ -678,6 +704,13 @@ def step7_remove_duplicates(data):
 
 
 def step8_balance_data(data, strategy="downsample"):
+    """
+    按类别做简单重采样平衡。
+
+    说明：
+        - downsample 通过裁剪多数类降低偏置；
+        - upsample 通过复制少数类提升覆盖，但可能增加过拟合风险。
+    """
     logger.info("步骤8：平衡数据（策略：%s）", strategy)
 
     try:
@@ -735,15 +768,9 @@ def step8_balance_data(data, strategy="downsample"):
 
 def load_and_prepare_data(data_path, min_length=3, balance_strategy="downsample"):
     """
-    加载并准备训练数据（使用现有清洗流程）
+    按既定清洗流程加载并标准化训练数据。
 
-    Args:
-        data_path: 数据文件路径
-        min_length: 最小文本长度
-        balance_strategy: 数据平衡策略 ('downsample' 或 'upsample')
-
-    Returns:
-        清洗后的数据列表
+    返回结果统一为 {"text": ..., "label": ...} 结构，便于后续训练流程直接消费。
     """
     logger.info("=" * 60)
     logger.info("开始完整数据清洗流程")
@@ -824,6 +851,7 @@ def create_stratified_splits(
 
         use_stratify = min_label_count >= 2
         if not use_stratify:
+            # 样本过少时 sklearn 分层切分会失败，此处主动降级为普通随机切分。
             logger.warning("部分类别样本数不足 2，降级为非分层划分")
 
         train_val_texts, test_texts, train_val_labels, test_labels = train_test_split(
@@ -838,6 +866,7 @@ def create_stratified_splits(
         train_val_counts = Counter(train_val_labels)
         use_val_stratify = train_val_counts and min(train_val_counts.values()) >= 2
         if not use_val_stratify:
+            # 第二次切分后也可能出现极小类别，同样需要保护性降级。
             logger.warning("验证集划分阶段部分类别样本数不足 2，降级为非分层划分")
 
         train_texts, val_texts, train_labels, val_labels = train_test_split(
@@ -867,6 +896,7 @@ def create_stratified_splits(
 
 
 def build_label_mappings(data: List[Dict[str, str]]) -> Tuple[Dict[str, int], Dict[int, str]]:
+    """根据训练样本中的标签构建双向映射。"""
     labels = sorted({item["label"] for item in data if item.get("label")})
     if not labels:
         raise ValueError("未找到有效标签，无法构建标签映射")
@@ -912,7 +942,10 @@ def train_transformer_model(
 
 def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str, str]]):
     """
-    在测试集上评估模型
+    在测试集上评估模型。
+
+    除整体准确率外，还会输出详细分类报告与误判样本，
+    便于后续分析类别边界和清洗数据问题。
     """
     logger.info("测试集评估")
 
@@ -984,6 +1017,7 @@ def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str
 
 
 def main():
+    """命令行训练入口：串联数据清洗、训练、评估与结果汇总。"""
     try:
         if len(sys.argv) < 2:
             logger.error("参数不足")
