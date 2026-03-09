@@ -170,6 +170,18 @@ class RuntimeConfig:
     progress_path: Optional[str] = None
     flush_every: int = 20
     max_attempt_factor: int = 30
+    scenes: List[str] = field(default_factory=lambda: ["工作场景", "日常生活", "社交互动", "健康状况", "学习考试"])
+    scene_distribution: Optional[List[float]] = None
+    personas: List[str] = field(default_factory=lambda: ["学生", "职场人", "朋友", "家人", "普通用户"])
+    persona_distribution: Optional[List[float]] = None
+    intensity_levels: List[str] = field(default_factory=lambda: ["轻度", "中度", "强烈"])
+    intensity_distribution: Optional[List[float]] = None
+    event_types: List[str] = field(default_factory=lambda: ["考试结果", "工作反馈", "人际互动", "身体状态", "购物体验", "出行过程", "家庭事务", "线上交流", "娱乐体验", "突发消息"])
+    event_distribution: Optional[List[float]] = None
+    tone_styles: List[str] = field(default_factory=lambda: ["日常口语", "网络表达", "克制表达", "强情绪表达"])
+    tone_distribution: Optional[List[float]] = None
+    enable_contrast_pairs: bool = True
+    contrast_pair_ratio: float = 0.35
     retry: RetryConfig = field(default_factory=RetryConfig)
 
 
@@ -224,6 +236,11 @@ class ProgressState:
     style_counts: Dict[str, int] = field(default_factory=dict)
     length_counts: Dict[str, int] = field(default_factory=dict)
     scene_counts: Dict[str, int] = field(default_factory=dict)
+    persona_counts: Dict[str, int] = field(default_factory=dict)
+    intensity_counts: Dict[str, int] = field(default_factory=dict)
+    event_counts: Dict[str, int] = field(default_factory=dict)
+    tone_counts: Dict[str, int] = field(default_factory=dict)
+    contrast_pair_count: int = 0
     last_update_ts: float = 0.0
     status: str = "initialized"
 
@@ -707,9 +724,16 @@ class SentimentDataCollector:
         self.enable_ppl = runtime_cfg.enable_ppl
         self.flush_every = max(1, runtime_cfg.flush_every)
 
-        self.scenes = ["工作场景", "日常生活", "社交互动", "健康状况", "学习考试"]
+        self.scenes = runtime_cfg.scenes or ["工作场景", "日常生活", "社交互动", "健康状况", "学习考试"]
         self.sentence_types = {"陈述句": 0.4, "疑问句": 0.2, "感叹句": 0.3, "祈使句": 0.1}
         self.length_types = {"短文本": (5, 15, 0.3), "中文本": (16, 30, 0.4), "长文本": (31, 50, 0.3)}
+        self.personas = runtime_cfg.personas or ["学生", "职场人", "朋友", "家人", "普通用户"]
+        self.intensity_levels = runtime_cfg.intensity_levels or ["轻度", "中度", "强烈"]
+        self.event_types = runtime_cfg.event_types or ["考试结果", "工作反馈", "人际互动", "身体状态", "购物体验", "出行过程", "家庭事务", "线上交流", "娱乐体验", "突发消息"]
+        self.tone_styles = runtime_cfg.tone_styles or ["日常口语", "网络表达", "克制表达", "强情绪表达"]
+        self.enable_contrast_pairs = bool(runtime_cfg.enable_contrast_pairs)
+        self.contrast_pair_ratio = max(0.0, min(1.0, float(runtime_cfg.contrast_pair_ratio)))
+        self._queued_specs: List[Dict[str, str]] = []
         self.sensitive_words = {"暴恐", "涉黄", "政治极端", "仇恨言论"}
 
         self.exact_set = set()
@@ -744,7 +768,29 @@ class SentimentDataCollector:
             self.target_count,
         )
         self.scene_targets = self._build_targets(
-            self.scenes, [1 / len(self.scenes)] * len(self.scenes), self.target_count
+            self.scenes,
+            runtime_cfg.scene_distribution or [1 / len(self.scenes)] * len(self.scenes),
+            self.target_count,
+        )
+        self.persona_targets = self._build_targets(
+            self.personas,
+            runtime_cfg.persona_distribution or [1 / len(self.personas)] * len(self.personas),
+            self.target_count,
+        )
+        self.intensity_targets = self._build_targets(
+            self.intensity_levels,
+            runtime_cfg.intensity_distribution or [0.3, 0.5, 0.2][: len(self.intensity_levels)] if len(self.intensity_levels) <= 3 else [1 / len(self.intensity_levels)] * len(self.intensity_levels),
+            self.target_count,
+        )
+        self.event_targets = self._build_targets(
+            self.event_types,
+            runtime_cfg.event_distribution or [1 / len(self.event_types)] * len(self.event_types),
+            self.target_count,
+        )
+        self.tone_targets = self._build_targets(
+            self.tone_styles,
+            runtime_cfg.tone_distribution or [0.4, 0.2, 0.2, 0.2][: len(self.tone_styles)] if len(self.tone_styles) <= 4 else [1 / len(self.tone_styles)] * len(self.tone_styles),
+            self.target_count,
         )
 
         self.state = ProgressState(
@@ -754,6 +800,10 @@ class SentimentDataCollector:
             style_counts={k: 0 for k in self.style_targets},
             length_counts={k: 0 for k in self.length_targets},
             scene_counts={k: 0 for k in self.scene_targets},
+            persona_counts={k: 0 for k in self.persona_targets},
+            intensity_counts={k: 0 for k in self.intensity_targets},
+            event_counts={k: 0 for k in self.event_targets},
+            tone_counts={k: 0 for k in self.tone_targets},
             status="initializing",
         )
         self.start_ts = time.time()
@@ -805,7 +855,18 @@ class SentimentDataCollector:
         keys, weights = zip(*remain_items)
         return random.choices(keys, weights=weights, k=1)[0]
 
-    def _build_prompt(self, category: str, scene: str, sentence_type: str, length_type: str) -> str:
+    def _build_prompt(
+        self,
+        category: str,
+        scene: str,
+        sentence_type: str,
+        length_type: str,
+        persona: str,
+        intensity: str,
+        event_type: str,
+        tone_style: str,
+        contrast_label: str = "",
+    ) -> str:
         lo, hi, _ = self.length_types[length_type]
         few_shot = [
             {"text": "这个项目终于完成了，感觉松了一口气。", "label": "平静"},
@@ -820,12 +881,28 @@ class SentimentDataCollector:
             "constraints": {
                 "target_label": category,
                 "scene": scene,
+                "persona": persona,
+                "emotion_intensity": intensity,
+                "event_type": event_type,
+                "tone_style": tone_style,
                 "sentence_type": sentence_type,
                 "length_chars_range": [lo, hi],
-                "naturalness": "口语化、自然、不生硬",
+                "naturalness": "口语化、自然、不生硬，像真实用户在对应场景里的表达",
+                "diversity": [
+                    "避免模板化开头",
+                    "避免空泛鸡汤句",
+                    "优先使用具体事件、关系、时间或动作细节",
+                    "同一情绪在不同场景下表达方式要有差异",
+                    "同一场景下不同语气风格要体现明显差别"
+                ],
                 "forbidden": ["敏感内容", "暴恐涉黄", "明显乱码", "重复模板句"],
                 "output_format": '严格输出JSON: {"text":"...","label":"..."}，不要输出额外解释',
             },
+            "contrast_guidance": (
+                f"如果可行，请让文本与标签 {contrast_label} 在同场景下形成可区分的对照表达，但不要直接提及对照标签。"
+                if contrast_label
+                else ""
+            ),
             "few_shot": few_shot,
         }
         return json.dumps(prompt, ensure_ascii=False)
@@ -961,6 +1038,11 @@ class SentimentDataCollector:
             self.state.style_counts.update(restored.style_counts)
             self.state.length_counts.update(restored.length_counts)
             self.state.scene_counts.update(restored.scene_counts)
+            self.state.persona_counts.update(restored.persona_counts)
+            self.state.intensity_counts.update(restored.intensity_counts)
+            self.state.event_counts.update(restored.event_counts)
+            self.state.tone_counts.update(restored.tone_counts)
+            self.state.contrast_pair_count = restored.contrast_pair_count
             for k, v in restored.label_counts.items():
                 if k in self.state.label_counts:
                     self.state.label_counts[k] = max(self.state.label_counts[k], v)
@@ -986,7 +1068,15 @@ class SentimentDataCollector:
 
     async def _generate_one(self, spec: Dict[str, str]) -> Optional[Record]:
         prompt = self._build_prompt(
-            spec["label"], spec["scene"], spec["sentence_type"], spec["length_type"]
+            spec["label"],
+            spec["scene"],
+            spec["sentence_type"],
+            spec["length_type"],
+            spec["persona"],
+            spec["intensity"],
+            spec["event_type"],
+            spec["tone_style"],
+            spec.get("contrast_label", ""),
         )
         try:
             raw, model_name = await asyncio.wait_for(
@@ -1065,6 +1155,12 @@ class SentimentDataCollector:
             self.state.style_counts[spec["sentence_type"]] = self.state.style_counts.get(spec["sentence_type"], 0) + 1
             self.state.length_counts[spec["length_type"]] = self.state.length_counts.get(spec["length_type"], 0) + 1
             self.state.scene_counts[spec["scene"]] = self.state.scene_counts.get(spec["scene"], 0) + 1
+            self.state.persona_counts[spec["persona"]] = self.state.persona_counts.get(spec["persona"], 0) + 1
+            self.state.intensity_counts[spec["intensity"]] = self.state.intensity_counts.get(spec["intensity"], 0) + 1
+            self.state.event_counts[spec["event_type"]] = self.state.event_counts.get(spec["event_type"], 0) + 1
+            self.state.tone_counts[spec["tone_style"]] = self.state.tone_counts.get(spec["tone_style"], 0) + 1
+            if spec.get("contrast_group_id"):
+                self.state.contrast_pair_count += 1
 
             if len(self._pending_flush) >= self.flush_every or self._is_done():
                 self._flush_pending_sync()
@@ -1087,12 +1183,55 @@ class SentimentDataCollector:
             log_event(self.logger, "error", "flush_failed", reason=str(e), count=len(self._pending_flush))
             self._pending_flush.clear()
 
-    def _build_one_spec(self) -> Dict[str, str]:
+    def _choose_contrast_label(self, label: str) -> str:
+        contrast_map = {
+            "平静": ["生气", "惊讶", "伤心"],
+            "开心": ["伤心", "厌恶", "生气"],
+            "伤心": ["开心", "平静", "惊讶"],
+            "生气": ["平静", "开心", "厌恶"],
+            "惊讶": ["平静", "开心", "生气"],
+            "厌恶": ["开心", "平静", "惊讶"],
+        }
+        candidates = [x for x in contrast_map.get(label, self.categories) if x != label]
+        return random.choice(candidates or [x for x in self.categories if x != label])
+
+    def _build_base_spec(self) -> Dict[str, str]:
         label = self._choose_from_remaining(self.category_targets, self.state.label_counts)
         scene = self._choose_from_remaining(self.scene_targets, self.state.scene_counts)
         stype = self._choose_from_remaining(self.style_targets, self.state.style_counts)
         ltype = self._choose_from_remaining(self.length_targets, self.state.length_counts)
-        return {"label": label, "scene": scene, "sentence_type": stype, "length_type": ltype}
+        persona = self._choose_from_remaining(self.persona_targets, self.state.persona_counts)
+        intensity = self._choose_from_remaining(self.intensity_targets, self.state.intensity_counts)
+        event_type = self._choose_from_remaining(self.event_targets, self.state.event_counts)
+        tone_style = self._choose_from_remaining(self.tone_targets, self.state.tone_counts)
+        return {
+            "label": label,
+            "scene": scene,
+            "sentence_type": stype,
+            "length_type": ltype,
+            "persona": persona,
+            "intensity": intensity,
+            "event_type": event_type,
+            "tone_style": tone_style,
+        }
+
+    def _build_one_spec(self) -> Dict[str, str]:
+        if self._queued_specs:
+            return self._queued_specs.pop(0)
+
+        spec = self._build_base_spec()
+        if self.enable_contrast_pairs and random.random() < self.contrast_pair_ratio and self._remaining_target() > 1:
+            contrast_group_id = hashlib.sha1(
+                f"{time.time()}-{random.random()}-{spec['scene']}-{spec['event_type']}".encode("utf-8")
+            ).hexdigest()[:16]
+            contrast_label = self._choose_contrast_label(spec["label"])
+            spec["contrast_group_id"] = contrast_group_id
+            spec["contrast_label"] = contrast_label
+            paired_spec = dict(spec)
+            paired_spec["label"] = contrast_label
+            paired_spec["contrast_label"] = spec["label"]
+            self._queued_specs.append(paired_spec)
+        return spec
 
     async def _run_dispatch_loop(self):
         max_attempts = self.target_count * max(1, self.cfg.max_attempt_factor)
@@ -1330,6 +1469,18 @@ def build_arg_parser():
     p.add_argument("--flush_every", type=int, default=20, help="累计多少条后安全落盘")
     p.add_argument("--progress_path", type=str, default=None, help="断点续跑进度文件路径")
     p.add_argument("--max_attempt_factor", type=int, default=30, help="最大尝试次数系数")
+    p.add_argument("--scenes", type=str, default="工作场景,日常生活,社交互动,健康状况,学习考试,家庭关系,校园生活,职场协作,消费购物,出行通勤,网络互动,文娱体验")
+    p.add_argument("--scene_distribution", type=str, default=None, help="多场景分布，逗号分隔，长度需与 scenes 一致")
+    p.add_argument("--personas", type=str, default="学生,职场人,朋友,家人,普通用户,消费者,创作者")
+    p.add_argument("--persona_distribution", type=str, default=None, help="人物身份分布，逗号分隔")
+    p.add_argument("--intensity_levels", type=str, default="轻度,中度,强烈")
+    p.add_argument("--intensity_distribution", type=str, default="0.3,0.5,0.2", help="情绪强度分布，逗号分隔")
+    p.add_argument("--event_types", type=str, default="考试结果,工作反馈,人际互动,身体状态,购物体验,出行过程,家庭事务,线上交流,娱乐体验,突发消息")
+    p.add_argument("--event_distribution", type=str, default=None, help="事件类型分布，逗号分隔")
+    p.add_argument("--tone_styles", type=str, default="日常口语,网络表达,克制表达,强情绪表达")
+    p.add_argument("--tone_distribution", type=str, default=None, help="口语风格分布，逗号分隔")
+    p.add_argument("--enable_contrast_pairs", action="store_true", help="启用同场景不同情绪的对照样本生成")
+    p.add_argument("--contrast_pair_ratio", type=float, default=0.35, help="对照样本比例，范围 0-1")
 
     p.add_argument("--model", type=str, default="gpt-4")
     p.add_argument("--provider", type=str, default="openai")
