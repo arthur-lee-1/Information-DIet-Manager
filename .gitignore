@@ -87,10 +87,13 @@ src/lsj/src/algorithms/utils/config.json
 
 .continue
 
-src/lsj/src/training_data. i d e a / 
+src/lsj/src/training_data. i d e a /
  
  . i d e a / 
  
- 
-
+chrome-extension
+frontend
+node_modules
 src/lsj/src/algorithms/utils/*.json
+src/chrome-extension
+src/hyh
