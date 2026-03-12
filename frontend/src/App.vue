@@ -202,7 +202,7 @@ const fetchAndInjectData = async () => {
     // 2. 请求历史趋势数据 (对应 API 契约 3.2: GET /analyze/history?limit=7)
     // 注意：这里由于不确定你们后端的具体返回数组结构，编写了保护性的数据映射
     const historyRes = await axios.get(`${API_BASE_URL}/analyze/history?limit=7`)
-    const history = historyRes.data || []
+    const history = Array.isArray(historyRes.data?.runs) ? historyRes.data.runs : []
     
     // 提取重复率和情绪数组 (假设后端返回的是包含 repeat_ratio 等字段的对象数组)
     // 真实的解析逻辑可能需要根据你队友实际返回的 JSON 结构微调
