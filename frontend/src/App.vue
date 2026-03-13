@@ -269,7 +269,21 @@ const loadDrawerData = async (silent = false) => {
 
   try {
     const res = await axios.get(`${API_BASE_URL}/analyze/history?limit=50`)
-    const records = res.data || []
+    
+    // 修复：智能解包后端的对象格式，寻找真正的数组
+    let records = [];
+    if (Array.isArray(res.data)) {
+      records = res.data; // 如果后端直接返回数组
+    } else if (res.data && typeof res.data === 'object') {
+      // 适配标准的封装格式，自动去捞取 items, data, records 或 history 字段
+      records = res.data.items || res.data.data || res.data.records || res.data.history || [];
+    }
+
+    // 保险：如果连这些字段都不是，强行设为空数组，防止 .filter 崩溃
+    if (!Array.isArray(records)) {
+      console.warn("未知的 History API 响应格式，已触发数组降级保护:", res.data);
+      records = [];
+    }
 
     const catRecords = currentCategoryKey.value === 'global' 
       ? records 
