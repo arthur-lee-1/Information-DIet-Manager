@@ -1,104 +1,184 @@
-# Information-DIet-Manager
+<div align="center">
 
-2Manage the information you take in every day just like you manage your diet.
+# 🧠 Information Diet Manager
 
-You can define your own database location by setting the IDM_DB_PATH environment variable, otherwise the database location will be created in this directory.
+**信息摄取质量评估与“信息茧房”分析工具**
 
-## 项目简介
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?style=flat-square&logo=googlechrome&logoColor=white)](https://developer.chrome.com/docs/extensions/)
+[![Vite](https://img.shields.io/badge/Vite-Frontend-646CFF?style=flat-square&logo=vite&logoColor=white)](https://vitejs.dev/)
 
-Information Diet Manager 是一个用于评估用户“信息茧房”程度的工具。它支持多种数据采集方式，包括网站后端数据抓取和 Chrome 浏览器插件自动采集用户浏览信息。通过分析用户的浏览行为和内容分布，帮助用户了解自身的信息摄入多样性和偏向性。
+</div>
 
-## 主要功能
+---
 
-- 数据模型与数据库结构定义（src/hyh/）
-- 主程序与数据分析逻辑（src/lsj/src/main.py）
-- 数据抓取工具（src/lsj/src/utils/fetch_data.py）
-- Chrome 插件采集用户浏览信息（url、标题、meta、正文、停留时长等）
-- 后端 API 接收并存储浏览数据
-- 信息茧房程度评估与分析
+## 📖 项目简介
 
-## 项目结构
+Information Diet Manager 用于评估用户的信息摄取结构与“信息茧房”程度，支持：
 
-```
-Information-DIet-Manager/
-├── README.md
+- Chrome 插件自动采集浏览信息（URL、标题、正文摘要等）
+- FastAPI 后端接收、清洗、存储数据
+- 分析引擎执行分类、情感、相似度与综合评估
+- 可视化摘要与导出（JSON / JSONL / CSV）
+
+---
+
+## ✨ 核心功能
+
+- **数据采集**：浏览器插件自动抓取网页信息并上报
+- **数据接入**：`/collect`、`/import` 支持实时与批量导入
+- **数据存储**：SQLite（默认）+ 标准化哈希去重
+- **分析评估**：
+  - 内容分类（category）
+  - 情感分析（sentiment / polarity）
+  - 相似度计算（similarity）
+  - 信息摄取质量评估（summary/report）
+- **结果输出**：
+  - 仪表盘摘要 `/dashboard/summary`
+  - 可视化数据 `/dashboard/visualization`
+  - 导出给分析脚本 `/export/lsj`、`/export/lsj/training`
+
+---
+
+## 🏗️ 当前项目结构（重构后）
+
+```text
+INFORMATION-DIET-MANAGER/
+├── chrome-extension/              # Chrome 插件（采集端）
+├── docs/                          # 文档
+├── frontend/                      # 前端（Vite）
+├── scripts/
+│   ├── run_backend.py             # 后端启动脚本（推荐）
+│   └── run_analysis.py            # 分析入口脚本（推荐）
 ├── src/
-│   ├── hyh/                        # 后端服务（FastAPI + SQLite）
-│   │   ├── CONTRACT.md             # 接口与约定说明
-│   │   ├── import_formats.md       # 数据导入格式说明
-│   │   ├── ingest_item.schema.json # 数据结构定义（JSON Schema）
-│   │   ├── models.py               # Pydantic 数据模型
-│   │   ├── schema.sql              # 数据库表结构
-│   │   ├── app.py                  # FastAPI 应用（API 路由）
-│   │   ├── db.py                   # 数据库连接管理
-│   │   └── utils.py                # URL/文本规范化与哈希
-│   ├── lsj/                        # 本地数据抓取与分析
-│   │   ├── requirements.txt        # 依赖库
-│   │   └── src/
-│   │       ├── main.py             # 主程序入口
-│   │       └── utils/
-│   │           └── fetch_data.py   # Chrome 本地历史记录抓取
-│   └── chrome-extension/           # Chrome 浏览器插件
-│       ├── manifest.json           # 插件清单（Manifest V3）
-│       ├── background.js           # Service Worker：停留时长追踪与数据上传
-│       ├── content.js              # Content Script：提取页面元信息与正文
-│       ├── popup.html              # 插件弹窗界面
-│       └── popup.js                # 弹窗交互逻辑（API 地址配置、开关）
+│   ├── backend_api/               # 语义化后端入口（推荐）
+│   ├── analysis_engine/           # 语义化分析入口（推荐）
+│   ├── hyh/                       # legacy 后端实现（兼容保留）
+│   └── lsj/                       # legacy 分析实现（兼容保留）
+├── requirements.txt
+└── README.md
 ```
 
-## Chrome 插件集成说明
+> 说明：
+> `backend_api` / `analysis_engine` 是新的语义化入口层；
+> `hyh` / `lsj` 暂保留用于兼容旧代码与历史脚本。
 
-1. 用户安装 Chrome 插件后，插件会自动采集浏览信息（包括 url、标题、meta description、正文、停留时长等）。
-2. 插件将采集到的数据通过 HTTP POST 上传到后端 API（`/collect`），数据格式遵循 `IngestItem` 契约。
-3. 后端接收数据并存储到数据库，后续可通过 `/analyze/run` 和 `/dashboard/summary` 进行信息茧房程度分析。
+---
 
-### 安装 Chrome 插件
+## 🚀 快速开始
 
-1. 启动后端服务：`python src/hyh/app.py`
-2. 打开 Chrome 浏览器，进入 `chrome://extensions/`
-3. 打开右上角 **开发者模式**
-4. 点击 **加载已解压的扩展程序**，选择 `src/chrome-extension/` 目录
-5. 插件安装完成后，点击工具栏图标可配置后端 API 地址和采集开关
-6. 正常浏览网页即可，插件会自动采集并上传浏览数据
+## 1) 安装依赖
 
-### 插件工作原理
+建议在项目根目录操作：
 
-- **background.js (Service Worker)**：监听标签页切换和关闭事件，计算每个页面的停留时长，将数据发送到后端 `/collect` 接口
-- **content.js (Content Script)**：在页面加载完成后提取 meta description 或正文摘要（截取前 2000 字符），发送给 Service Worker
-- **popup.html / popup.js**：提供简单的配置界面，用户可设置后端 API 地址和启用/禁用数据采集
-- 忽略停留时间小于 2 秒的页面访问，以减少噪声数据
-- 仅采集 HTTP/HTTPS 页面，不采集浏览器内部页面
+```bash
+python -m venv .venv
+# Windows:
+# .venv\Scripts\activate
+# macOS/Linux:
+# source .venv/bin/activate
 
-## 技术栈
+pip install -r requirements.txt
+```
 
-- Python（后端与数据分析）
-- Chrome Extension（前端数据采集）
-- RESTful API（数据上传与交互）
-- 数据库（结构见 schema.sql）
+---
 
-## 快速开始
+## 2) 启动后端（推荐方式）
 
-1. 安装后端依赖：
-   ```cmd
-   pip install fastapi uvicorn pydantic
-   ```
-2. 启动后端服务：
-   ```cmd
-   uvicorn src.hyh.app:app --reload --port 8000
-   ```
-3. 安装 Chrome 插件：
-   - 打开 `chrome://extensions/`，开启开发者模式
-   - 点击"加载已解压的扩展程序"，选择 `src/chrome-extension/` 目录
-4. 浏览网页，插件自动采集并上传数据
-5. 访问 `http://127.0.0.1:8000/docs` 查看 API 文档
-6. 调用 `POST /analyze/run` 运行分析，调用 `GET /dashboard/summary` 查看信息茧房评估结果
+```bash
+python scripts/run_backend.py
+```
 
-## 安全与隐私
+启动后访问：
 
-- 插件采集内容仅用于信息多样性分析。本地开发默认使用 HTTP，生产环境建议配置 HTTPS 以加密传输。
-- 用户可随时卸载插件或通过弹窗界面关闭数据上传。
+- Swagger 文档: `http://127.0.0.1:8000/docs`
+- ReDoc: `http://127.0.0.1:8000/redoc`
 
-## 贡献与开发
+---
 
-- 欢迎提交 issue 或 pull request。
-- 新增插件或分析模块请遵循模块化设计原则。
+## 3) 启动前端（可选）
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+---
+
+## 4) 安装 Chrome 插件
+
+1. 打开 `chrome://extensions/`
+2. 开启“开发者模式”
+3. 点击“加载已解压的扩展程序”
+4. 选择项目下 `chrome-extension/`
+5. 浏览网页后，插件将采集数据并上报后端
+
+---
+
+## 5) 运行分析（命令行）
+
+```bash
+python scripts/run_analysis.py --help
+```
+
+示例（analyze 模式）：
+
+```bash
+python scripts/run_analysis.py \
+  --mode analyze \
+  --input_file data.json \
+  --output_file result.json
+```
+
+---
+
+## 🔌 主要 API
+
+- `POST /collect`：单条采集入库
+- `POST /import`：文件导入（csv/json/jsonl）
+- `GET /items`：分页查询原始数据
+- `POST /analyze/run`：轻量分析
+- `POST /analyze/run_full`：全量分析任务
+- `GET /analyze/jobs/{job_id}`：任务状态
+- `GET /analyze/result/{job_id}`：任务结果
+- `GET /dashboard/summary`：摘要指标
+- `GET /dashboard/visualization`：可视化数据
+- `GET /export/lsj`：导出分析数据
+- `GET /export/lsj/training`：导出训练数据
+
+---
+
+## 🔄 数据流说明
+
+1. Chrome 插件采集网页内容
+2. POST 到后端 `/collect`
+3. 后端规范化、去重、入库
+4. 调用 `/analyze/run_full` 触发分析管道
+5. 前端或脚本读取 `/dashboard/*` 与 `/analyze/result/*` 结果
+
+---
+
+## 🧩 常见问题
+
+### 1) `ModuleNotFoundError: No module named 'src'`
+
+请确保在**项目根目录**运行命令，优先使用：
+
+```bash
+python scripts/run_backend.py
+```
+
+### 2) 插件没有数据上报
+
+- 确认后端已启动（`127.0.0.1:8000`）
+- 确认插件配置的 API 地址正确
+- 在扩展管理页查看 service worker 日志排错
+
+---
+
+## 📄 License
+
+仅供课程/研究与学习用途。
+如需对外发布，请补充明确的 LICENSE 文件与隐私说明。
