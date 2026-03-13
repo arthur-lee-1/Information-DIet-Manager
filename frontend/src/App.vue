@@ -276,6 +276,7 @@ const currentDrawerData = reactive({
   timeline: []       
 })
 
+// 👉 抽屉数据拉取：已切换至正确的 /items 底层接口
 const loadDrawerData = async (silent = false) => {
   if (!silent) {
     currentDrawerData.isLoading = true;
@@ -286,35 +287,23 @@ const loadDrawerData = async (silent = false) => {
   }
 
   try {
-    const res = await axios.get(`${API_BASE_URL}/analyze/history?limit=50`)
+
+    const res = await axios.get(`${API_BASE_URL}/items?limit=50`)
     
     let records = [];
-    
-    console.log("👉 后端返回的原始数据:", res.data); // 
-
-    if (res.data) {
-      // 优先级 1：如果根目录下直接有 items，直接抓取！（大概率是这个）
-      if (Array.isArray(res.data.items)) {
-        records = res.data.items;
-      } 
-      // 优先级 2：如果真的是嵌套在 runs 里面的二维数组
-      else if (Array.isArray(res.data.runs) && res.data.runs.some(r => Array.isArray(r.items))) {
-        records = res.data.runs.flatMap(run => run.items || []);
-      }
-      // 优先级 3：其他常见情况
-      else if (Array.isArray(res.data.data)) records = res.data.data;
-      else if (Array.isArray(res.data.records)) records = res.data.records;
-      else if (Array.isArray(res.data.history)) records = res.data.history;
-      else if (Array.isArray(res.data)) records = res.data;
+    if (Array.isArray(res.data)) {
+      records = res.data; // 如果后端直接返回 [ {...}, {...} ]
+    } else if (res.data && typeof res.data === 'object') {
+      // 如果后端包了一层，比如 { items: [...] } 或 { data: [...] }
+      records = res.data.items || res.data.data || res.data.records || [];
     }
 
-    console.log("👉 扫描后真正提取到的 records:", records);
-
     if (!Array.isArray(records) || records.length === 0) {
-      console.warn("⚠️ 警告：解包后是个空数组，请检查上方打印的原始数据里到底有没有 url 和 title！");
+      console.warn("⚠️ /items 接口返回为空，或者格式无法识别:", res.data);
       records = [];
     }
 
+    // 筛选出属于当前领域的记录
     const catRecords = currentCategoryKey.value === 'global' 
       ? records 
       : records.filter(r => r.category === currentCategoryKey.value || r.alias === currentCategoryKey.value || r.category === t.value.cats[currentCategoryKey.value])
@@ -345,6 +334,7 @@ const loadDrawerData = async (silent = false) => {
         }
       })
 
+      // 提取关键词标签
       let extractedTags = [];
       catRecords.forEach(r => {
         if (Array.isArray(r.tags)) extractedTags.push(...r.tags);
@@ -354,6 +344,7 @@ const loadDrawerData = async (silent = false) => {
       if (extractedTags.length === 0) extractedTags = [t.value.cats[currentCategoryKey.value] || '探索中', '近期浏览'];
       currentDrawerData.keywords = extractedTags;
 
+      // 动态 AI 处方
       const repeatCount = currentDrawerData.timeline.filter(i => i.visits > 1).length;
       const negCount = currentDrawerData.timeline.filter(i => i.sentiment === 'neg').length;
       
